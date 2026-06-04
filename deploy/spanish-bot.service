@@ -1,0 +1,12 @@
+[Unit]
+Description=Spanish Learning Telegram Bot
+After=network-online.target spanish-backend.service
+
+[Service]
+WorkingDirectory=/home/anton/spanish-app/bot
+ExecStart=/home/anton/spanish-app/bot/.venv/bin/python telegram_bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

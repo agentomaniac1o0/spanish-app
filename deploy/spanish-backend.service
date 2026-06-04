@@ -1,0 +1,12 @@
+[Unit]
+Description=Spanish Learning Backend
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/anton/spanish-app/backend
+ExecStart=/home/anton/spanish-app/backend/.venv/bin/uvicorn app.main:app --host 100.103.32.107 --port 8100
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
