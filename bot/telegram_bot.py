@@ -1,15 +1,16 @@
 """
 Spanish Learning Telegram Bot — @spanishdudebot
-State machine for guided lessons, SRS reviews, and Hermes conversation handoff.
+State machine for guided lessons, SRS reviews, translation exercises, and Hermes conversation.
 """
 import os
+import re
 import json
 import httpx
 from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler,
     MessageHandler, filters, ContextTypes,
@@ -19,21 +20,10 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://100.91.254.59:8100")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 # ── State machine ────────────────────────────────────────────────────────────
-# Per-user state tracked in memory. Keys: telegram user_id.
-# Each state: {
-#   "state": str,        # "idle", "placement", "lesson_warmup", "lesson_vocab",
-#                         # "lesson_grammar", "review", "conversation"
-#   "user_id": int,      # Backend user ID
-#   "level": str,        # A0–B2
-#   "data": dict,        # Current lesson/vocab data
-#   "step": int,         # Current step in flow
-#   "score": int,        # Running score
-# }
 USER_STATES: dict[int, dict] = {}
 
 
 def _api(method: str, path: str, body: dict | None = None) -> dict | None:
-    """Call the Spanish Backend API."""
     url = f"{BACKEND_URL}{path}"
     try:
         if method == "GET":
@@ -49,14 +39,50 @@ def _api(method: str, path: str, body: dict | None = None) -> dict | None:
         return None
 
 
+# ── Fuzzy translation check ─────────────────────────────────────────────────
+
+def _normalize(text: str) -> str:
+    """Normalize text for fuzzy comparison: lowercase, strip accents, trim."""
+    replacements = {
+        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ü": "u", "ñ": "n",
+        "Á": "a", "É": "e", "Í": "i", "Ó": "o", "Ú": "u", "Ü": "u", "Ñ": "n",
+        "¿": "", "¡": "", "?": "", "!": "", ".": "", ",": "",
+    }
+    t = text.lower().strip()
+    for k, v in replacements.items():
+        t = t.replace(k, v)
+    return " ".join(t.split())
+
+
+def _check_translation(user_input: str, correct_answer: str) -> tuple[bool, str]:
+    """Check if user translation matches expected answer. Returns (is_correct, feedback)."""
+    norm_input = _normalize(user_input)
+    norm_correct = _normalize(correct_answer)
+    
+    if norm_input == norm_correct:
+        return True, ""
+
+    # Handle alternative correct answers (| separated in correct_answer)
+    alternatives = [a.strip() for a in correct_answer.split("|")]
+    for alt in alternatives:
+        if _normalize(alt) == norm_input:
+            return True, ""
+
+    # Partial match: user forgot/misspelled article
+    input_parts = set(norm_input.split())
+    correct_parts = set(norm_correct.split())
+    if correct_parts.issubset(input_parts) or len(correct_parts & input_parts) >= len(correct_parts) * 0.8:
+        return False, f"Fast! Richtig wäre: *{correct_answer}*"
+
+    return False, f"❌ Nicht ganz. Die Antwort ist: *{correct_answer}*"
+
+
 # ── Commands ─────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Register user and show welcome."""
     uid = update.effective_user.id
     username = update.effective_user.username or update.effective_user.first_name
 
-    # Register via backend
     resp = _api("POST", "/api/users/register", {
         "telegram_id": uid, "username": username,
     })
@@ -87,12 +113,15 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📚 *Spanisch-Lehrer Bot*\n\n"
         "/start — Start/Registrierung\n"
-        "/leccion — Geführte Lektion (Warmup → Vokabeln → Grammatik → Konversation)\n"
-        "/review — Fällige Vokabeln (SRS)\n"
+        "/leccion — Geführte Lektion (SRS-Warmup → Übersetzen → Grammatik)\n"
+        "/review — Fällige Vokabeln üben (Übersetzen + SRS)\n"
         "/gramatica — Grammatik von Hermes erklärt\n"
         "/hablar — Freies Spanisch-Gespräch\n"
         "/progreso — Lernstatistik\n"
-        "/help — Diese Hilfe",
+        "/help — Diese Hilfe\n\n"
+        "✏️ Bei Übersetzungen: Einfach die Antwort tippen! "
+        "Artikel sind wichtig (el/la/los/las). "
+        "Akzente (á,é,í,ó,ú,ñ) sind optional.",
         parse_mode="Markdown",
     )
 
@@ -121,7 +150,7 @@ async def progreso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── Placement test ──────────────────────────────────────────────────────────
+# ── Placement test (MC is fine for diagnostics) ─────────────────────────────
 
 PLACEMENT_QUESTIONS = [
     {"q": "Was heißt 'Haus' auf Spanisch?", "opts": ["casa", "perro", "rojo", "agua"], "ans": 0, "lvl": "A0"},
@@ -152,7 +181,7 @@ async def _send_placement_question(update_or_query, uid: int):
         [InlineKeyboardButton(opt, callback_data=f"place_{step}_{i}")]
         for i, opt in enumerate(q["opts"])
     ]
-    text = f"📝 Frage {step + 1}/{len(PLACEMENT_QUESTIONS)}\n\n{q['q']}"
+    text = f"📝 Frage {step + 1}/8\n\n{q['q']}"
     
     if hasattr(update_or_query, 'message'):
         await update_or_query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -163,9 +192,7 @@ async def _send_placement_question(update_or_query, uid: int):
 async def _finish_placement(update_or_query, uid: int):
     user = USER_STATES[uid]
     score = user["score"]
-    total = len(PLACEMENT_QUESTIONS)
-    pct = score / total * 100
-
+    pct = score / 8 * 100
     if pct >= 85: level = "B1"
     elif pct >= 60: level = "A2"
     elif pct >= 30: level = "A1"
@@ -174,22 +201,14 @@ async def _finish_placement(update_or_query, uid: int):
     user["level"] = level
     user["state"] = "idle"
 
-    # Update backend
-    _api("POST", "/api/placement/answer", {
-        "user_id": user["user_id"],
-        "score": score,
-        "total": total,
-        "level": level,
-    })
-
-    msg = f"✅ Einstufungstest abgeschlossen!\n\nDein Niveau: *{level}*\n({score}/{total} richtig)"
+    msg = f"✅ Einstufungstest: *{level}* ({score}/8)\n\nStarte mit /leccion!"
     if hasattr(update_or_query, 'message'):
         await update_or_query.message.reply_text(msg, parse_mode="Markdown")
     else:
         await update_or_query.edit_message_text(msg, parse_mode="Markdown")
 
 
-# ── Lektion flow ────────────────────────────────────────────────────────────
+# ── Lektion flow: SRS → Übersetzen ──────────────────────────────────────────
 
 async def leccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -201,87 +220,218 @@ async def leccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get next lesson from backend
     lesson = _api("GET", f"/api/lessons/next?user_id={user['user_id']}")
     if not lesson:
-        await update.message.reply_text("Keine neue Lektion verfügbar. Nutze /review für Wiederholungen!")
+        await update.message.reply_text("Keine neue Lektion. Nutze /review für Wiederholungen!")
         return
 
-    user["state"] = "lesson_warmup"
-    user["data"] = lesson
-    user["step"] = 0
+    # Get due words for warmup
+    due_words = []
+    ctx = _api("GET", f"/api/users/{user['user_id']}/context")
+    if ctx:
+        due_words = ctx.get("due_words", [])
 
+    user["state"] = "lesson_warmup"
+    user["data"] = {"due_words": due_words, "lesson": lesson}
+    user["step"] = 0
+    user["score"] = 0
+
+    parts = []
+    if due_words:
+        parts.append(f"🔄 {len(due_words)} fällige Vokabeln warmup")
+    parts.append(f"📖 *{lesson.get('title', 'Lektion')}* ({lesson.get('level', '?')})")
+    parts.append("✏️ Übersetzungs-Übungen")
+    
     await update.message.reply_text(
-        f"📖 *{lesson['title']}*\nLevel: {lesson['level']} | Unit: {lesson['unit']}\n\n"
-        f"Die Lektion hat 3 Teile:\n1️⃣ Warmup (SRS-Review)\n2️⃣ Neue Vokabeln\n3️⃣ Grammatik\n\n"
-        f"Lass uns starten! 🚀",
+        f"📚 Lektion startet!\n\n" + "\n".join(f"{i+1}. {p}" for i, p in enumerate(parts)),
         parse_mode="Markdown",
     )
-    # Start warmup
-    await _start_warmup(update, uid)
+
+    if due_words:
+        await _send_srs(update, uid)
+    else:
+        user["state"] = "lesson_translate"
+        user["step"] = 0
+        await _load_translation_words(update, uid)
 
 
-async def _start_warmup(update: Update, uid: int):
-    user = USER_STATES[uid]
-    user["state"] = "lesson_warmup"
-    user["step"] = 0
-
-    due = _api("GET", f"/api/users/{user['user_id']}/context")
-    due_words = due.get("due_words", []) if due else []
-
-    if not due_words:
-        user["state"] = "lesson_vocab"
-        await update.message.reply_text("Keine fälligen Reviews — direkt zu neuen Vokabeln! 📝")
-        return
-
-    user["data"]["due_words"] = due_words
-    await _send_warmup_word(update, uid)
-
-
-async def _send_warmup_word(update: Update, uid: int):
+async def _send_srs(update_or_query, uid: int):
+    """SRS warmup: show word, ask for difficulty rating."""
     user = USER_STATES[uid]
     step = user["step"]
     words = user["data"].get("due_words", [])
 
     if step >= len(words):
-        user["state"] = "lesson_vocab"
+        user["state"] = "lesson_translate"
         user["step"] = 0
-        await update.message.reply_text(
-            f"✅ Warmup abgeschlossen! ({len(words)} Vokabeln)\n\nJetzt: Neue Vokabeln lernen!",
-        )
+        msg = "✅ Warmup fertig!\n\nJetzt: ✏️ Übersetzen — schreib die spanische Übersetzung!"
+        if hasattr(update_or_query, 'message'):
+            await update_or_query.message.reply_text(msg)
+        else:
+            await update_or_query.edit_message_text(msg)
+        await _load_translation_words(update_or_query, uid)
         return
 
     word = words[step]
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔴 Again", callback_data=f"srs_{word['id']}_1"),
-         InlineKeyboardButton("🟠 Hard", callback_data=f"srs_{word['id']}_2")],
-        [InlineKeyboardButton("🟢 Good", callback_data=f"srs_{word['id']}_3"),
-         InlineKeyboardButton("🔵 Easy", callback_data=f"srs_{word['id']}_4")],
+        [InlineKeyboardButton("🔴 Again", callback_data=f"srs_{word.get('word_id',0)}_{uid}_1"),
+         InlineKeyboardButton("🟠 Hard", callback_data=f"srs_{word.get('word_id',0)}_{uid}_2")],
+        [InlineKeyboardButton("🟢 Good", callback_data=f"srs_{word.get('word_id',0)}_{uid}_3"),
+         InlineKeyboardButton("🔵 Easy", callback_data=f"srs_{word.get('word_id',0)}_{uid}_4")],
     ])
-    await update.message.reply_text(
-        f"🔄 Review {step + 1}/{len(words)}\n\n*{word['spanish']}*",
-        reply_markup=keyboard, parse_mode="Markdown",
-    )
+    text = f"🔄 {step + 1}/{len(words)}\n\n*{word['spanish']}*\n_{word['german']}_"
+    if hasattr(update_or_query, 'message'):
+        await update_or_query.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await update_or_query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
 
-# ── SRS review ──────────────────────────────────────────────────────────────
+async def _load_translation_words(update_or_query, uid: int):
+    """Load new words from the lesson for translation practice."""
+    user = USER_STATES[uid]
+    lesson = user["data"].get("lesson", {})
+    level = lesson.get("level", user["level"])
+
+    # Get words from backend API for this lesson
+    words_resp = _api("GET", f"/api/lessons/{lesson.get('id', 0)}?user_id={user['user_id']}")
+    if words_resp and words_resp.get("content"):
+        content = words_resp["content"]
+        word_list = content.get("words", [])
+    else:
+        word_list = []
+
+    if not word_list:
+        # Fallback: get due words for translation practice
+        ctx = _api("GET", f"/api/users/{user['user_id']}/context")
+        word_list = []
+        if ctx:
+            for w in ctx.get("due_words", []):
+                word_list.append({"spanish": w["spanish"], "german": w["german"], "id": w.get("word_id", 0)})
+
+    import random
+    random.shuffle(word_list)
+    user["data"]["new_words"] = word_list[:8]
+
+
+async def _send_translation(update_or_query, uid: int):
+    """Send next translation exercise (DE → ES)."""
+    user = USER_STATES[uid]
+    step = user["step"]
+    words = user["data"].get("new_words", [])
+
+    if step >= len(words):
+        user["state"] = "idle"
+        total = user["score"]
+        msg = (
+            f"🎉 Lektion abgeschlossen!\n\n"
+            f"Richtig: *{total}/{len(words)}*\n\n"
+            f"Neue Vokabeln sind jetzt in deinem SRS-Lernplan.\n"
+            f"/leccion — Nächste Lektion\n"
+            f"/review — Wiederholen\n"
+            f"/progreso — Fortschritt"
+        )
+        if hasattr(update_or_query, 'message'):
+            await update_or_query.message.reply_text(msg, parse_mode="Markdown")
+        else:
+            await update_or_query.edit_message_text(msg, parse_mode="Markdown")
+        return
+
+    word = words[step]
+    # 80% of the time: DE→ES (harder, better for learning)
+    # 20% of the time: ES→DE (easier, recognition)
+    direction = "DE_ES"
+    if step > 0 and step % 5 == 0:
+        direction = "ES_DE"
+
+    user["data"]["current_word"] = word
+    user["data"]["direction"] = direction
+
+    if direction == "DE_ES":
+        prompt = f"✏️ {step + 1}/{len(words)}\n\nWie heißt *\"{word['german']}\"* auf Spanisch?"
+    else:
+        prompt = f"✏️ {step + 1}/{len(words)}\n\nWas bedeutet *\"{word['spanish']}\"*?"
+
+    if hasattr(update_or_query, 'message'):
+        await update_or_query.message.reply_text(prompt, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    else:
+        await update_or_query.edit_message_text(prompt, parse_mode="Markdown")
+
 
 async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Review mode: translation exercises for all due words."""
     uid = update.effective_user.id
     user = USER_STATES.get(uid)
     if not user:
         await update.message.reply_text("Bitte zuerst /start")
         return
 
-    due = _api("GET", f"/api/users/{user['user_id']}/context")
-    due_words = due.get("due_words", []) if due else []
+    ctx = _api("GET", f"/api/users/{user['user_id']}/context")
+    due_words = ctx.get("due_words", []) if ctx else []
 
     if not due_words:
-        await update.message.reply_text("🎉 Keine fälligen Vokabeln! Alles im Griff.")
+        await update.message.reply_text("🎉 Keine fälligen Vokabeln! ¡Muy bien!")
         return
 
     user["state"] = "review"
+    user["data"]["new_words"] = [
+        {"spanish": w["spanish"], "german": w["german"], "id": w.get("word_id", 0)}
+        for w in due_words
+    ]
     user["step"] = 0
-    user["data"]["due_words"] = due_words
-    await update.message.reply_text(f"📚 {len(due_words)} fällige Vokabeln. Los geht's!")
-    await _send_warmup_word(update, uid)
+    user["score"] = 0
+    await update.message.reply_text(f"📚 {len(due_words)} Vokabeln zum Üben!\n✏️ Schreib die Übersetzung:")
+    await _send_translation(update, uid)
+
+
+# ── Text handler: translation answers ────────────────────────────────────────
+
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    text = update.message.text.strip() if update.message.text else ""
+
+    if not text:
+        return
+
+    user = USER_STATES.get(uid)
+    if not user:
+        await update.message.reply_text("Bitte /start für die Registrierung.")
+        return
+
+    state = user.get("state", "")
+    
+    if state in ("lesson_translate", "review"):
+        await _handle_translation_answer(update, uid, text)
+    elif state == "conversation":
+        await update.message.reply_text("💬 _Hermes-Konversation folgt in Phase 3._", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("Nutze /help um die Kommandos zu sehen.")
+
+
+async def _handle_translation_answer(update: Update, uid: int, text: str):
+    user = USER_STATES[uid]
+    word = user["data"].get("current_word", {})
+    direction = user["data"].get("direction", "DE_ES")
+    
+    if direction == "DE_ES":
+        correct = word.get("spanish", "")
+        is_correct, feedback = _check_translation(text, correct)
+    else:
+        correct = word.get("german", "")
+        is_correct, feedback = _check_translation(text, correct)
+
+    if is_correct:
+        user["score"] += 1
+        await update.message.reply_text(f"✅ ¡Correcto! ({user['score']}/{user['step'] + 1})", parse_mode="Markdown")
+        # Record to SRS
+        if user.get("user_id") and word.get("id"):
+            _api("POST", "/api/vocab/review", {
+                "user_id": user["user_id"],
+                "word_id": word.get("id", 0),
+                "rating": 4,  # Easy — user translated correctly
+            })
+    else:
+        await update.message.reply_text(feedback, parse_mode="Markdown")
+
+    user["step"] += 1
+    await _send_translation(update, uid)
 
 
 # ── Callback handler ─────────────────────────────────────────────────────────
@@ -312,12 +462,12 @@ async def _handle_placement(query, uid: int, data: str):
 
 
 async def _handle_srs(query, uid: int, data: str):
-    _, word_id_str, rating_str = data.split("_")
+    _, word_id_str, state_uid_str, rating_str = data.split("_")
     word_id = int(word_id_str)
     rating = int(rating_str)
 
-    user = USER_STATES[uid]
-    if user.get("user_id"):
+    user = USER_STATES.get(uid)
+    if user and user.get("user_id"):
         _api("POST", "/api/vocab/review", {
             "user_id": user["user_id"],
             "word_id": word_id,
@@ -325,20 +475,17 @@ async def _handle_srs(query, uid: int, data: str):
         })
 
     user["step"] += 1
-    if user["state"] == "lesson_warmup":
-        await _send_warmup_word(query, uid)
-    elif user["state"] == "review":
-        await _send_warmup_word(query, uid)
+    await _send_srs(query, uid)
 
 
-# ── Conversation / Grammar via Hermes (skeleton) ────────────────────────────
+# ── Conversation / Grammar placeholders ──────────────────────────────────────
 
 async def hablar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "💬 *Konversations-Modus*\n\n"
-        "Schreib mir auf Spanisch und ich korrigiere dich! "
-        "Hermes (dein KI-Spanischlehrer) übernimmt gleich.\n\n"
-        "_Phase 3: Hermes-Integration folgt in Kürze._",
+        "Schreib mir auf Spanisch! Hermes (dein KI-Lehrer) "
+        "wird dich bald korrigieren und mit dir sprechen.\n\n"
+        "_Phase 3 folgt in Kürze._",
         parse_mode="Markdown",
     )
 
@@ -351,38 +498,18 @@ async def gramatica(update: Update, context: ContextTypes.DEFAULT_TYPE):
     grammar = _api("GET", f"/api/grammar/{level}")
     if grammar and isinstance(grammar, list) and grammar:
         g = grammar[0]
+        examples = ""
+        if g.get("examples"):
+            for ex in g["examples"]:
+                examples += f"• *{ex['spanish']}* — {ex['german']}\n"
         await update.message.reply_text(
             f"📖 *{g['title']}* ({level})\n\n{g['explanation']}\n\n"
-            f"Mehr Grammatik: Hermes erklärt live in Kürze!",
+            f"{examples}\n"
+            f"_Mehr live-Grammatik via Hermes folgt in Phase 3._",
             parse_mode="Markdown",
         )
     else:
-        await update.message.reply_text(
-            "Grammatik-Erklärungen folgen in Phase 3 via Hermes!",
-        )
-
-
-# ── Text handler ────────────────────────────────────────────────────────────
-
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    text = update.message.text.strip() if update.message.text else ""
-
-    if not text:
-        return
-
-    # Check for Spanish text in conversation mode
-    user = USER_STATES.get(uid)
-    if user and user.get("state") == "conversation":
-        await update.message.reply_text(
-            f"📝 _Deine Nachricht:_ {text}\n\n"
-            "_Hermes-Konversation folgt in Phase 3._",
-            parse_mode="Markdown",
-        )
-    else:
-        await update.message.reply_text(
-            "Nutze /help um die Kommandos zu sehen.",
-        )
+        await update.message.reply_text("Grammatik via Hermes folgt in Phase 3!")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -390,7 +517,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("leccion", leccion))
@@ -398,11 +524,7 @@ def main():
     app.add_handler(CommandHandler("gramatica", gramatica))
     app.add_handler(CommandHandler("hablar", hablar))
     app.add_handler(CommandHandler("progreso", progreso))
-
-    # Callbacks (inline keyboard)
     app.add_handler(CallbackQueryHandler(on_callback))
-
-    # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     app.run_polling()
