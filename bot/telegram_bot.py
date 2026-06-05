@@ -50,22 +50,20 @@ def _check_translation(user_input: str, correct: str) -> tuple[bool, str]:
 
 
 def _load_words(user_id: int, level: str, count: int = 10) -> list[dict]:
-    """Load words for a user from backend. Auto-assigns new words if needed."""
-    # First try getting due words
+    """Load due words from SRS. Only assign new words if queue is empty."""
     ctx = _api("GET", f"/api/users/{user_id}/context")
-    words = []
-    if ctx:
-        words = ctx.get("due_words", [])
-    if words:
-        return words[:count]
-
-    # No due words — assign new words from curriculum
-    resp = _api("POST", "/api/vocab/assign", {
-        "user_id": user_id, "level": level, "count": count,
-    })
-    if resp and resp.get("words"):
-        return resp["words"]
-    return []
+    words = ctx.get("due_words", []) if ctx else []
+    
+    # If not enough due words, top up with new ones
+    if len(words) < count:
+        needed = count - len(words)
+        resp = _api("POST", "/api/vocab/assign", {
+            "user_id": user_id, "level": level, "count": needed,
+        })
+        if resp and resp.get("words"):
+            words.extend(resp["words"])
+    
+    return words[:count]
 
 
 # ── Commands ─────────────────────────────────────────────────────────────────
@@ -200,6 +198,16 @@ async def leccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"2️⃣ Übersetzen: {len(words)} Wörter\n\n"
         f"Los geht's!", parse_mode="Markdown")
 
+    # Send unit image as header
+    units = set(w.get("unit", "") for w in words if w.get("unit"))
+    if units:
+        unit_name = list(units)[0]
+        try:
+            img_data = httpx.get(f"{BACKEND_URL}/static/units/unit_{unit_name}.jpg", timeout=5).content
+            await update.message.reply_photo(img_data, caption=f"📖 Unit: {unit_name}")
+        except Exception:
+            pass
+
     await _send_srs(update, uid)
 
 
@@ -223,6 +231,16 @@ async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔊 Tipp: Jede Vokabel kommt mit Audio.",
         parse_mode="Markdown")
     u["state"] = "review"
+
+    # Send unit image as header
+    units = set(w.get("unit", "") for w in words if w.get("unit"))
+    if units:
+        unit_name = list(units)[0]
+        try:
+            img_data = httpx.get(f"{BACKEND_URL}/static/units/unit_{unit_name}.jpg", timeout=5).content
+            await update.message.reply_photo(img_data, caption=f"📖 Unit: {unit_name}")
+        except Exception:
+            pass
     await _send_translation(update, uid)
 
 
@@ -337,10 +355,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _api("POST", "/api/vocab/review", {"user_id": u["user_id"], "word_id": wid, "rating": 4})
         else:
             await update.message.reply_text(f"❌ {fb}", parse_mode="Markdown")
-            # Record wrong answer so it reappears in next review
+            # Record for FSRS (will reappear tomorrow)
             wid = w.get("word_id") or w.get("id", 0)
             if u.get("user_id") and wid:
                 _api("POST", "/api/vocab/review", {"user_id": u["user_id"], "word_id": wid, "rating": 1})
+            # Also re-add to current session for immediate re-practice (max once)
+            w_copy = dict(w)
+            w_copy["_retry"] = w.get("_retry", 0) + 1
+            if w_copy["_retry"] <= 2:
+                u["data"]["lesson_words"].append(w_copy)
 
         # Send audio AFTER answer (reinforcement) — must upload file, not URL (Tailscale IP not public)
         wid = w.get("word_id") or w.get("id", 0)

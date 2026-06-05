@@ -69,6 +69,7 @@ async def get_due_words(db: AsyncSession, user_id: int, limit: int = 10):
             "word_id": word.id,
             "spanish": word.spanish,
             "german": word.german,
+            "unit": word.unit or "",
             "state": uw.state,
             "stability": uw.stability,
             "difficulty": uw.difficulty,

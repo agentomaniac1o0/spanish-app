@@ -60,6 +60,7 @@ async def assign_words(data: dict, db: AsyncSession = Depends(get_db)):
                 "word_id": word.id,
                 "spanish": word.spanish,
                 "german": word.german,
+                "unit": word.unit or "",
             })
 
     await db.commit()
