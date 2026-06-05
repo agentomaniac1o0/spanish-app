@@ -1,4 +1,4 @@
-# Spanish Learning App — Projektplan
+# Spanish Learning App — Projektplan (v2, gegrillt 2026-06-05)
 
 ## Konzept
 
@@ -6,7 +6,7 @@ Professionelles Spanisch-Lernprogramm, nutzbar via Telegram-Chat mit **Hermes al
 Hybrid-Ansatz: strukturierte Lektionen + freie Konversations-Praxis.
 Adaptiver Einstieg per Einstufungstest. Spaced Repetition (FSRS) für Vokabeln.
 
-## Architektur
+## Architektur (aktualisiert)
 
 ```
 Telegram User
@@ -15,61 +15,77 @@ Telegram User
 Telegram Bot API
     │
     ▼
-┌─────────────────────────────────────────────┐
-│  ai-agents VM 101                            │
-│                                               │
-│  ┌──────────────────┐  ┌──────────────────┐  │
-│  │ Telegram Bot      │  │ Spanish Backend   │  │
-│  │ (python-telegram-  │  │ (FastAPI :8100)   │  │
-│  │  bot, systemd)    │  │ SQLite + FSRS     │  │
-│  └──────┬───────────┘  └────────┬─────────┘  │
-│         │                       │             │
-│         │  ┌────────────────────┘             │
-│         │  │                                  │
-│         ▼  ▼                                  │
-│  ┌──────────────┐                              │
-│  │ LLM Router    │                              │
-│  │ OpenRouter    │                              │
-│  │ DeepSeek V4   │                              │
-│  └──────────────┘                              │
-└─────────────────────────────────────────────┘
-         │
-         │ (SSH: Konversations-Modus)
-         ▼
-┌─────────────────────────────────────────────┐
-│  Hermes LXC 105                              │
-│  ┌──────────────────────────────────────┐    │
-│  │ Spanisch-Lehrer Skill                 │    │
-│  │ - Konversationspartner                │    │
-│  │ - Fehlerkorrektur                     │    │
-│  │ - Grammatik-Erklärungen               │    │
-│  └──────────────────────────────────────┘    │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│  LXC 106 — spanish-app (2 GB RAM, 40 GB)     │
+│  Tailscale: <neue IP> :8100                   │
+│                                                │
+│  ┌──────────────────┐  ┌──────────────────┐   │
+│  │ Telegram Bot      │  │ Spanish Backend   │   │
+│  │ (python-telegram-  │  │ (FastAPI :8100)   │   │
+│  │  bot, systemd)    │  │ SQLite + FSRS v5  │   │
+│  └──────┬───────────┘  └────────┬─────────┘   │
+│         │                       │              │
+└─────────┼───────────────────────┼──────────────┘
+          │                       │
+          │ HTTP (Hermes GW)      │ HTTP (Tailscale)
+          ▼                       ▼
+┌────────────────────┐  ┌──────────────────────────────────┐
+│  Hermes LXC 105    │  │  Backend API (von Hermes genutzt) │
+│  Spanisch-Lehrer   │  │  GET  /api/vocab/due             │
+│  Skill (LLM-Kopf)  │  │  POST /api/vocab/review          │
+│  · Konversation    │  │  POST /api/vocab/add (Konv.)     │
+│  · Grammatik live  │  │  GET  /api/users/{id}/context    │
+│  · Fehlerkorrektur │  │  GET  /api/grammar/{level}       │
+└────────────────────┘  └──────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────┐
+│  VM 101 — ai-agents (Entwicklung + Deployment)            │
+│  ~/spanish-app/ → rsync → LXC 106                        │
+└──────────────────────────────────────────────────────────┘
 ```
+
+## Entscheidungen (Grill-Session 2026-06-05)
+
+| Thema | Entscheidung |
+|-------|-------------|
+| **Backend-Standort** | LXC 106 (nicht VM 101) |
+| **Bot-Standort** | LXC 106 (zusammen mit Backend) |
+| **LLM-Provider** | Hermes (LXC 105) macht alle LLM-Calls |
+| **Backend-Rolle** | Reiner Datenspeicher + FSRS-Engine, kein LLM |
+| **Content-Strategie** | Gemischt: Vokabeln/Lektionen statisch, Grammatik/Dialoge dynamisch von Hermes |
+| **Hermes-Anbindung** | Hermes Gateway HTTP API (nicht SSH) |
+| **FSRS-Eigentümer** | Backend (Source of Truth), Hermes ruft API |
+| **Deployment** | rsync VM 101 → LXC 106 |
+| **Bildgenerierung** | Dual-Use: DreamShaper LCM → App (komprimiert) + Stock (4x-UltraSharp, 9 MP+, Nextcloud) |
+| **Stock-Konvention** | 9 MP Minimum (Adobe Stock: 4 MP) |
+| **LXC 106** | 2 GB RAM, 40 GB Disk, Debian, Tailscale |
+| **Single-User** | Ja (Dan), skalierbar später |
+| **Audio (TTS)** | edge-tts auf Hermes, per Wort + Beispielsatz |
 
 ## Technologie-Stack
 
 | Schicht | Technologie | Begründung |
 |---------|-------------|-----------|
-| Backend | FastAPI (async) | Vorhanden auf VM 101, bewährt im Trading-App |
+| Backend | FastAPI (async) | Bewährt im Trading-App |
 | ORM | SQLAlchemy 2.0 + aiosqlite | Gleicher Stack wie Trading-Backend |
-| DB | SQLite | Einfach, keine separate DB, reicht für Single-User |
-| SRS | FSRS v5 | Moderner Anki-Nachfolger, mathematisch fundiert |
+| DB | SQLite | Einfach, reicht für Single-User |
+| SRS | FSRS v5 | Moderner Anki-Nachfolger |
 | Bot | python-telegram-bot (async) | Beste async Telegram-Bibliothek |
-| LLM | OpenRouter DeepSeek V4 Flash | Gleicher Provider wie Hermes |
-| Deployment | systemd user unit | Gleiches Muster wie trading-backend |
+| LLM | Hermes (OpenRouter DeepSeek V4 Flash) | Hermes hat LLM-Infra bereits |
+| Deployment | systemd units | Kein Docker nötig |
+| Bilder | RunPod Serverless + ComfyUI v2 | DreamShaper + 4x-UltraSharp |
 
 ## Phasen
 
-### Phase 1: Backend + Curriculum (Kern)
+### Phase 1: Backend + Curriculum (Kern) ✅
 
-- [ ] FastAPI-Service auf Port 8100
-- [ ] SQLite-Datenmodell (users, words, user_words, lessons, user_lessons, grammar)
-- [ ] FSRS-Algorithmus (scheduler + review)
-- [ ] Curriculum-Seed-Daten (~500 Wörter, 30+ Lektionen, 20+ Grammatik-Punkte)
-- [ ] API: User-Erstellung, Lektionen, Vokabel-Review, Fortschritt
-- [ ] Einstufungstest-Logik (adaptiv, 10 Fragen)
-- [ ] systemd-Unit `spanish-backend.service`
+- [x] FastAPI-Service auf Port 8100
+- [x] SQLite-Datenmodell (users, words, user_words, lessons, user_lessons, grammar)
+- [x] FSRS-Algorithmus (scheduler + review)
+- [x] Curriculum-Seed-Daten (122 Wörter → muss auf 500+ erweitert werden)
+- [x] API: User-Erstellung, Lektionen, Vokabel-Review, Fortschritt
+- [x] Einstufungstest-Logik (adaptiv, 10 Fragen)
+- [ ] systemd-Unit `spanish-backend.service` (angepasst für LXC 106)
 
 ### Phase 2: Telegram Bot
 
@@ -77,16 +93,54 @@ Telegram Bot API
 - [ ] State-Machine für Konversations-Flows (Einstufungstest, Lektion, Review)
 - [ ] Inline-Keyboard für SRS-Bewertungen (Again/Hard/Good/Easy)
 - [ ] Kommandos: /start, /leccion, /review, /gramatica, /hablar, /progreso, /help
-- [ ] systemd-Unit `spanish-bot.service`
+- [ ] systemd-Unit `spanish-bot.service` (angepasst für LXC 106)
 
 ### Phase 3: Hermes-Integration
 
-- [ ] Hermes-Skill für Spanisch-Lehrer-Rolle
-- [ ] SSH-Bridge: Bot → Hermes für Konversations-Modus
+- [ ] Hermes-Skill für Spanisch-Lehrer-Rolle (Konversation + Grammatik live)
+- [ ] HTTP-Bridge: Bot → Hermes Gateway API für Konversations-Modus
 - [ ] Kontext-Weitergabe (Level, bekannte Wörter, letzte Themen)
-- [ ] Automatische Vokabel-Aufnahme aus Konversationen
+- [ ] Automatische Vokabel-Aufnahme aus Konversationen (POST /api/vocab/add)
+- [ ] Alten `spanish-adaptive` Skill + Cron entfernen
 
-## Datenmodell
+### Phase 4: Content-Erweiterung
+
+- [ ] Curriculum 122 → 500+ Wörter mit image_prompt + example_sentences
+- [ ] Unit-Stimmungsbilder per ComfyUI generieren
+- [ ] Audio (edge-tts) für alle Vokabeln + Beispielsätze
+
+## Lern-Flow (Täglicher Zyklus)
+
+```
+09:00  Telegram-Opener → "Buenos días! Zeit für Spanisch ☀️"
+         │
+         ▼ [Button: "Lektion starten"]
+  ┌──────────────┐
+  │ 1. WARMUP    │  5 fällige FSRS-Vokabeln (Inline: 🔴/🟠/🟢/🔵)
+  │    ~2 Min    │  Again / Hard / Good / Easy
+  └──────┬───────┘
+         ▼
+  ┌──────────────┐
+  │ 2. LEKTION   │  Neue Unit (10 Wörter) mit Bildern
+  │    ~5 Min    │  · Bild + spanisches Wort
+  │              │  · Bild + deutsches Wort → spanisch tippen
+  │              │  · Audio (TTS) → nachsprechen
+  └──────┬───────┘
+         ▼
+  ┌──────────────┐
+  │ 3. GRAMMATIK │  Hermes erklärt 1 Grammatik-Punkt (dynamisch)
+  │    ~3 Min    │  + 2-3 Übungssätze (Lückentext)
+  └──────┬───────┘
+         ▼
+  ┌──────────────┐
+  │ 4. KONVERS.  │  Hermes: freies Gespräch mit neuen Wörtern
+  │    ~5 Min    │  Neue Vokabeln → automatisch in FSRS
+  └──────────────┘
+         │
+         ▼  [Statistik: +12 Wörter, 85% korrekt, Streak 7🔥]
+```
+
+## Datenmodell (unverändert)
 
 ### users
 | Spalte | Typ | Beschreibung |
@@ -110,9 +164,12 @@ Telegram Bot API
 | german | TEXT | Deutsche Übersetzung |
 | word_type | TEXT | noun, verb, adjective, phrase |
 | level | TEXT | A0, A1, A2, B1, B2 |
-| unit | TEXT | Thematische Einheit (z.B. "restaurant", "travel") |
+| unit | TEXT | Thematische Einheit |
+| gender | TEXT | m/f/n (für Nomen) |
 | example_sentence | TEXT | Beispielsatz auf Spanisch |
 | example_translation | TEXT | Beispielsatz auf Deutsch |
+| image_prompt | TEXT | Prompt für Bild-Generierung |
+| audio_url | TEXT | TTS-Audio URL (generiert) |
 
 ### user_words (FSRS-Parameter pro User+Wort)
 | Spalte | Typ | Beschreibung |
@@ -130,62 +187,49 @@ Telegram Bot API
 | next_review | TEXT | Nächste fällige Review |
 | source | TEXT | "lesson" oder "conversation" |
 
-### lessons
-| Spalte | Typ | Beschreibung |
-|--------|-----|-------------|
-| id | INTEGER PK | Lektions-ID |
-| title | TEXT | Titel (z.B. "Im Restaurant bestellen") |
-| level | TEXT | Schwierigkeitsgrad |
-| unit | TEXT | Thematische Einheit |
-| lesson_type | TEXT | vocab, grammar, dialogue, mixed |
-| sort_order | INTEGER | Reihenfolge innerhalb Unit |
-| content_json | TEXT | JSON: Übungen, Dialoge, Erklärungen |
+### lessons, user_lessons, grammar_points — unverändert
 
-### user_lessons
-| Spalte | Typ | Beschreibung |
-|--------|-----|-------------|
-| user_id | INTEGER FK | User |
-| lesson_id | INTEGER FK | Lektion |
-| completed_at | TEXT | Abschlussdatum |
-| score | INTEGER | Ergebnis (0-100) |
-| time_spent | INTEGER | Bearbeitungszeit in Sekunden |
-
-### grammar_points
-| Spalte | Typ | Beschreibung |
-|--------|-----|-------------|
-| id | INTEGER PK | Grammatik-ID |
-| title | TEXT | Titel (z.B. "Ser vs Estar") |
-| level | TEXT | Schwierigkeitsgrad |
-| explanation | TEXT | Erklärung auf Deutsch |
-| examples_json | TEXT | JSON: Beispielsätze Spanisch+Deutsch |
-| sort_order | INTEGER | Lernreihenfolge |
-
-## API-Endpoints (Phase 1)
+## API-Endpoints
 
 | Methode | Pfad | Beschreibung |
 |---------|------|-------------|
 | POST | /api/users/register | Telegram-User anlegen |
 | GET | /api/users/{id}/progress | Fortschritt abrufen |
+| GET | /api/users/{id}/context | User-Kontext für Hermes |
 | POST | /api/placement/start | Einstufungstest starten |
-| POST | /api/placement/answer | Frage beantworten → nächste Frage/Ergebnis |
+| POST | /api/placement/answer | Frage beantworten |
 | GET | /api/lessons/next | Nächste fällige Lektion |
 | GET | /api/lessons/{id} | Lektions-Inhalt abrufen |
 | POST | /api/lessons/{id}/complete | Lektion abschließen |
 | GET | /api/vocab/due | Fällige SRS-Vokabeln |
 | POST | /api/vocab/review | SRS-Bewertung abgeben |
-| GET | /api/grammar/{level} | Grammatik-Punkte für Level |
-| GET | /api/conversation/context | User-Kontext für Hermes |
+| POST | /api/vocab/add | Neues Wort aus Konversation hinzufügen |
+| GET | /api/grammar/{level} | Grammatik-Punkte für Level (Cache) |
 | GET | /api/stats/{id} | Lernstatistik (XP, Streak, Wörter) |
 
-## FSRS-Algorithmus
+## Bot-Kommandos
 
-Implementierung des Free Spaced Repetition Scheduler v5:
-- Input: User-Bewertung (1=Again, 2=Hard, 3=Good, 4=Easy)
-- Parameter: w[0..12] (Default-Weights aus FSRS-Benchmark)
-- Berechnet: Stabilität, Schwierigkeit, nächster Review-Termin
-- Formel aus: https://github.com/open-spaced-repetition/py-fsrs
+| Kommando | Funktion |
+|----------|----------|
+| /start | Registrierung + Einstufungstest starten |
+| /leccion | Geführter Flow: Warmup → Lektion → Grammatik → Konversation |
+| /review | Nur fällige Vokabeln (SRS) |
+| /gramatica | Grammatik live von Hermes |
+| /hablar | Freie Konversation mit Hermes |
+| /progreso | Lernstatistik anzeigen |
+| /help | Alle Kommandos |
 
-## Curriculum (Seed-Daten)
+## Konventionen
+
+- Alle Services binden an Tailscale-IP des LXC 106
+- API-Key-Auth wie Trading-Backend (optional)
+- Config per `.env` + pydantic-settings
+- systemd units auf LXC 106
+- SQLite-DB unter `backend/data/spanish.db`
+- Deployment: rsync von VM 101 zu LXC 106
+- Bilder Dual-Use: App (lokal komprimiert) + Stock (Nextcloud /Hermes-HL/ai-pics-stockversion/)
+
+## Curriculum
 
 ### Levels
 - **A0** (Absoluter Anfänger): Alphabet, Zahlen, Farben, Basis-Phrasen
@@ -194,56 +238,11 @@ Implementierung des Free Spaced Repetition Scheduler v5:
 - **B1** (Fortgeschritten): Nachrichten, Kultur, Meinungen, Vergangenheit
 - **B2** (Selbstständig): Diskussionen, Fachthemen, Hypothesen
 
-### Units (30+)
+### Units (25+)
 restaurant, shopping, travel, family, weather, home, work, health,
 directions, numbers, time, food, clothing, transport, hotel,
 emergency, hobbies, sports, nature, technology, culture, news,
-emotions, education, banking, phone, appointments, celebrations
+emotions, education, banking
 
-### Grammatik (20+ Punkte)
-ser/estar, por/para, bestimmte Artikel, unbestimmte Artikel,
-Adjektiv-Angleichung, regelmäßige Verben -ar/-er/-ir,
-unregelmäßige Verben, hay/estar, gustar, reflexiv,
-possessivpronomen, direkte/indirekte Pronomen,
-pretérito perfecto/indefinido/imperfecto, futuro simple,
-condicional, subjuntivo presente, imperativo, comparativo/superlativo
-
-## Ressourcen VM 101
-
-| Ressource | Status | Spanisch-App Bedarf | Bewertung |
-|-----------|--------|---------------------|-----------|
-| RAM | 5.2 GiB frei | ~80-120 MB | OK |
-| CPU | Intel N97, meist Idle | ~2-5% | OK |
-| Disk | 12G frei (89% voll) | ~300 MB | Engpass — Aufräumen nötig |
-| Swap | 1.8 GiB frei | — | OK |
-
-**Empfehlung:** VM 101 reicht aus. Kein separater LXC-Container nötig.
-Vor Installation ~5 GB aufräumen (alte venvs, Docker-Images, Logs).
-
-## Bot-Kommandos
-
-| Kommando | Funktion |
-|----------|----------|
-| /start | Registrierung + Einstufungstest starten |
-| /leccion | Nächste Lektion beginnen |
-| /review | Fällige Vokabeln (SRS) wiederholen |
-| /gramatica | Grammatik-Punkt erklärt bekommen |
-| /hablar | Freie Konversation mit Hermes starten |
-| /progreso | Lernstatistik anzeigen |
-| /help | Alle Kommandos anzeigen |
-
-## Konventionen
-
-- Alle Services binden an `100.103.32.107` (Tailscale-IP)
-- API-Key-Auth wie Trading-Backend (Middleware, optional)
-- Config per `.env` + pydantic-settings
-- Kein Docker — systemd user units
-- SQLite-DB unter `backend/data/spanish.db`
-
-## Offene Fragen (für Grill-Session)
-
-1. Hermes-Telegram-Gateway zuerst bauen oder Phase 3 als Teil davon?
-2. TTS für Aussprache-Übungen? (edge-tts läuft auf Hermes)
-3. Mehrere User? (Single-User reicht erstmal)
-4. Gamification-Elemente? (Achievements, Leaderboard)
-5. Audio-Aufnahmen für Aussprache-Checks?
+### Grammatik (dynamisch von Hermes)
+20+ Punkte als Seed-Themen, Erklärungen live generiert.

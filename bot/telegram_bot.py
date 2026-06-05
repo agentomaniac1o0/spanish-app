@@ -1,369 +1,410 @@
 """
-Spanish Learning Telegram Bot.
-
-Uses python-telegram-bot for async conversation handling.
-Connects to the Spanish Backend API for lesson/vocab data.
-Uses OpenRouter for AI-powered explanations and conversation practice.
+Spanish Learning Telegram Bot — @spanishdudebot
+State machine for guided lessons, SRS reviews, and Hermes conversation handoff.
 """
-
+import os
 import json
 import httpx
+from datetime import datetime
+from dotenv import load_dotenv
+load_dotenv()
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
-from telegram.constants import ParseMode
-
-from bot.config import (
-    BACKEND_URL,
-    BACKEND_API_KEY,
-    TELEGRAM_BOT_TOKEN,
-    OPENROUTER_API_KEY,
-    OPENROUTER_MODEL,
+    Application, CallbackQueryHandler, CommandHandler,
+    MessageHandler, filters, ContextTypes,
 )
 
+BACKEND_URL = os.getenv("BACKEND_URL", "http://100.91.254.59:8100")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+# ── State machine ────────────────────────────────────────────────────────────
+# Per-user state tracked in memory. Keys: telegram user_id.
+# Each state: {
+#   "state": str,        # "idle", "placement", "lesson_warmup", "lesson_vocab",
+#                         # "lesson_grammar", "review", "conversation"
+#   "user_id": int,      # Backend user ID
+#   "level": str,        # A0–B2
+#   "data": dict,        # Current lesson/vocab data
+#   "step": int,         # Current step in flow
+#   "score": int,        # Running score
+# }
 USER_STATES: dict[int, dict] = {}
 
 
-async def api_request(method: str, path: str, **kwargs):
-    async with httpx.AsyncClient(timeout=30) as client:
-        headers = {}
-        if BACKEND_API_KEY:
-            headers["X-API-Key"] = BACKEND_API_KEY
-        url = f"{BACKEND_URL}{path}"
-        resp = await client.request(method, url, headers=headers, **kwargs)
-        resp.raise_for_status()
-        return resp.json()
+def _api(method: str, path: str, body: dict | None = None) -> dict | None:
+    """Call the Spanish Backend API."""
+    url = f"{BACKEND_URL}{path}"
+    try:
+        if method == "GET":
+            r = httpx.get(url, timeout=10)
+        elif method == "POST":
+            r = httpx.post(url, json=body, timeout=10)
+        else:
+            return None
+        if r.status_code == 200:
+            return r.json()
+        return None
+    except Exception:
+        return None
 
 
-async def llm_chat(messages: list[dict]) -> str:
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": OPENROUTER_MODEL,
-                "messages": messages,
-                "temperature": 0.7,
-                "max_tokens": 800,
-            },
-        )
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
-
+# ── Commands ─────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await api_request("POST", "/api/users/register", json={
-        "telegram_id": user.id,
-        "username": user.username or "",
+    """Register user and show welcome."""
+    uid = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name
+
+    # Register via backend
+    resp = _api("POST", "/api/users/register", {
+        "telegram_id": uid, "username": username,
     })
-
-    text = (
-        f"Hola {user.first_name}!\n\n"
-        "Willkommen bei deinem Spanisch-Lernprogramm.\n\n"
-        "*/leccion* - Naechste Lektion starten\n"
-        "*/review* - Faellige Vokabeln wiederholen\n"
-        "*/gramatica* - Grammatik erklaert bekommen\n"
-        "*/hablar* - Freie Konversation ueben\n"
-        "*/progreso* - Lernstatistik anzeigen\n"
-        "*/help* - Alle Kommandos"
-    )
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Lektion starten", callback_data="cmd_leccion"),
-        InlineKeyboardButton("Vokabeln", callback_data="cmd_review"),
-    ], [
-        InlineKeyboardButton("Fortschritt", callback_data="cmd_progreso"),
-        InlineKeyboardButton("Einstufungstest", callback_data="cmd_placement"),
-    ]])
-
-    await update.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
-
-
-async def leccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    data = await api_request("GET", f"/api/lessons/next?user_id={user.id}")
-
-    if isinstance(data, dict) and "detail" in data:
-        await update.message.reply_text(data["detail"])
-        return
-
-    title = data.get("title", "Lektion")
-    content = data.get("content", {})
-    lesson_type = content.get("type", "vocab")
-    intro = content.get("intro", "")
-
-    msg = f"*{title}*\n\n{intro}\n\n"
-
-    if lesson_type == "dialogue":
-        scenes = content.get("scenes", [])
-        for s in scenes:
-            msg += f"*{s['speaker']}:* {s['spanish']}\n_{s['german']}_\n\n"
-
-    elif lesson_type == "vocab":
-        words = content.get("words", [])
-        for w in words:
-            msg += f"- *{w['spanish']}* - {w['german']}\n"
-
-    elif lesson_type == "grammar":
-        examples = content.get("examples", [])
-        for ex in examples:
-            msg += f"- {ex['spanish']}\n  _{ex['german']}_ ({ex.get('tense', '')})\n\n"
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Fertig", callback_data=f"complete|{data['id']}"),
-        InlineKeyboardButton("Erklaeren", callback_data=f"explain|{data['id']}"),
-    ]])
-
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-
-
-async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    words = await api_request("GET", f"/api/vocab/due?user_id={user.id}&limit=5")
-
-    if not words:
-        await update.message.reply_text("Keine faelligen Vokabeln! Gut gemacht.")
-        return
-
-    word = words[0]
-    user_state = USER_STATES.setdefault(user.id, {})
-    user_state["review_queue"] = words
-    user_state["review_index"] = 0
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Wieder (1)", callback_data="rate_1"),
-        InlineKeyboardButton("Schwer (2)", callback_data="rate_2"),
-        InlineKeyboardButton("Gut (3)", callback_data="rate_3"),
-        InlineKeyboardButton("Leicht (4)", callback_data="rate_4"),
-    ]])
+    if resp:
+        USER_STATES[uid] = {
+            "state": "idle", "user_id": resp["id"],
+            "level": resp["current_level"], "data": {}, "step": 0, "score": 0,
+        }
+        if not resp.get("placement_complete"):
+            await _start_placement(update, uid, resp["id"])
+            return
 
     await update.message.reply_text(
-        f"*{word['spanish']}*\n\n_({word['german']})_\n\nWie gut kanntest du das Wort?",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keyboard,
+        f"¡Hola {username}! 🇪🇸\n\n"
+        f"Dein Level: *{resp['current_level']}*\n"
+        f"Streak: {resp['streak']} Tage 🔥\n\n"
+        f"/leccion — Neue Lektion\n"
+        f"/review — Vokabeln wiederholen\n"
+        f"/gramatica — Grammatik lernen\n"
+        f"/hablar — Spanisch sprechen\n"
+        f"/progreso — Fortschritt\n"
+        f"/help — Hilfe",
+        parse_mode="Markdown",
     )
 
 
-async def gramatica(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    progress = await api_request("GET", f"/api/users/{user.id}/progress")
-    level = progress.get("level", "A0")
-
-    points = await api_request("GET", f"/api/conversation/grammar?level={level}")
-    if not points:
-        await update.message.reply_text("Keine Grammatik-Punkte fuer dein Level gefunden.")
-        return
-
-    p = points[0]
-    msg = f"*{p['title']}* ({p['level']})\n\n{p.get('explanation', '')}\n\n"
-
-    examples = p.get("examples", [])
-    if examples:
-        msg += "*Beispiele:*\n"
-        for ex in examples[:3]:
-            msg += f"- {ex['spanish']}\n  _{ex['german']}_\n\n"
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Naechster Punkt", callback_data="grammar_next"),
-    ]])
-
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-
-
-async def hablar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    context_data = await api_request("GET", f"/api/conversation/context?user_id={user.id}")
-
-    level = context_data["level"]
-    known = ", ".join(context_data["known_words_sample"][:10])
-
-    system_prompt = (
-        f"Du bist ein freundlicher Spanisch-Lehrer. Dein Schueler ist auf Level {level}.\n"
-        f"Bekannte Woerter: {known}.\n"
-        "Regeln:\n"
-        "- Sprich NUR Spanisch, es sei denn der Schueler fragt explizit auf Deutsch.\n"
-        f"- Passe dein Vokabular an Level {level} an.\n"
-        "- Wenn der Schueler einen Fehler macht, korrigiere ihn sanft und erklaere die Regel.\n"
-        "- Stelle Fragen, um die Konversation am Laufen zu halten.\n"
-        "- Halte Saetze kurz und klar."
-    )
-
-    user_state = USER_STATES.setdefault(user.id, {})
-    user_state["conversation_mode"] = True
-    user_state["conversation_history"] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "assistant", "content": "Hola! Soy tu profesor de espanol. De que quieres hablar hoy? (Du kannst auf Deutsch oder Spanisch antworten)"},
-    ]
-
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "*Konversations-Modus aktiviert!*\n\n"
-        "Hola! Soy tu profesor de espanol. De que quieres hablar hoy?\n"
-        "_Schreibe /stop um den Modus zu verlassen._",
-        parse_mode=ParseMode.MARKDOWN,
+        "📚 *Spanisch-Lehrer Bot*\n\n"
+        "/start — Start/Registrierung\n"
+        "/leccion — Geführte Lektion (Warmup → Vokabeln → Grammatik → Konversation)\n"
+        "/review — Fällige Vokabeln (SRS)\n"
+        "/gramatica — Grammatik von Hermes erklärt\n"
+        "/hablar — Freies Spanisch-Gespräch\n"
+        "/progreso — Lernstatistik\n"
+        "/help — Diese Hilfe",
+        parse_mode="Markdown",
     )
 
 
 async def progreso(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    stats = await api_request("GET", f"/api/conversation/stats?user_id={user.id}")
+    uid = update.effective_user.id
+    user = USER_STATES.get(uid)
+    if not user:
+        await update.message.reply_text("Bitte zuerst /start")
+        return
 
-    emoji_level = {"A0": "-", "A1": "-", "A2": "-", "B1": "-", "B2": "-"}
-    level_emoji = emoji_level.get(stats["level"], ">>")
+    stats = _api("GET", f"/api/stats/{user['user_id']}")
+    if not stats:
+        await update.message.reply_text("Statistik nicht verfügbar.")
+        return
 
-    msg = f"{level_emoji} *Dein Fortschritt*\n\n"
-    msg += f"Level: *{stats['level']}*\n"
-    msg += f"XP: *{stats['xp']}*\n"
-    msg += f"Streak: *{stats['streak']}* Tage\n"
-    msg += f"Gelernte Woerter: *{stats['total_words_learned']}*\n"
-    msg += f"Faellig heute: *{stats['words_due_today']}*\n"
-    msg += f"Lektionen: *{stats['lessons_completed']}* / {stats['total_lessons']}\n\n"
-
-    ws = stats.get("words_by_state", {})
-    msg += f"Neu: {ws.get('neu', 0)} | Lernend: {ws.get('lernend', 0)} | Gelernt: {ws.get('gelernt', 0)}\n"
-
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "*Spanisch-Lernprogramm*\n\n"
-        "*/leccion* - Naechste Lektion starten\n"
-        "*/review* - Faellige Vokabeln (SRS)\n"
-        "*/gramatica* - Grammatik erklaert\n"
-        "*/hablar* - Freie Konversation\n"
-        "*/progreso* - Lernstatistik\n"
-        "*/test* - Einstufungstest\n"
-        "*/stop* - Konversation beenden",
-        parse_mode=ParseMode.MARKDOWN,
+        f"📊 *Deine Lernstatistik*\n\n"
+        f"Niveau: *{stats.get('level', '?')}*\n"
+        f"Wörter gelernt: *{stats.get('total_words', 0)}*\n"
+        f"XP: *{stats.get('xp', 0)}*\n"
+        f"Streak: 🔥 *{stats.get('streak', 0)} Tage*\n"
+        f"Reviews fällig: *{stats.get('due_words', 0)}*\n"
+        f"Lektionen absolviert: *{stats.get('lessons_completed', 0)}*",
+        parse_mode="Markdown",
     )
 
 
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_state = USER_STATES.get(update.effective_user.id, {})
-    user_state.clear()
-    await update.message.reply_text("Modus beendet. /leccion oder /review zum Weitermachen.")
+# ── Placement test ──────────────────────────────────────────────────────────
+
+PLACEMENT_QUESTIONS = [
+    {"q": "Was heißt 'Haus' auf Spanisch?", "opts": ["casa", "perro", "rojo", "agua"], "ans": 0, "lvl": "A0"},
+    {"q": "Übersetze: 'Ich bin müde.'", "opts": ["Estoy cansado", "Soy cansado", "Tengo cansado", "Hay cansado"], "ans": 0, "lvl": "A1"},
+    {"q": "Was bedeutet 'ayer'?", "opts": ["heute", "morgen", "gestern", "jetzt"], "ans": 2, "lvl": "A1"},
+    {"q": "Welcher Satz ist korrekt?", "opts": ["El casa es grande", "La casa es grande", "Los casa es grande", "Las casa grande"], "ans": 1, "lvl": "A0"},
+    {"q": "Übersetze: 'Ich habe gegessen.'", "opts": ["He comido", "Estoy comer", "Voy a comer", "Comí ayer"], "ans": 0, "lvl": "A2"},
+    {"q": "Was ist der Unterschied zwischen 'por' und 'para'?", "opts": ["keiner", "por=Grund, para=Zweck", "por=Ort, para=Zeit", "por=Vergangenheit, para=Zukunft"], "ans": 1, "lvl": "A2"},
+    {"q": "Übersetze: 'Wenn ich Zeit hätte, würde ich reisen.'", "opts": ["Si tengo tiempo, viajo", "Si tuviera tiempo, viajaría", "Si tenía tiempo, viajaba", "Si tendré tiempo, viajaré"], "ans": 1, "lvl": "B1"},
+    {"q": "Was ist 'ojalá'?", "opts": ["Hoffentlich", "Leider", "Vielleicht", "Sicher"], "ans": 0, "lvl": "B1"},
+]
+
+async def _start_placement(update: Update, uid: int, backend_uid: int):
+    USER_STATES[uid]["state"] = "placement"
+    USER_STATES[uid]["step"] = 0
+    USER_STATES[uid]["score"] = 0
+    await _send_placement_question(update, uid)
 
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _send_placement_question(update_or_query, uid: int):
+    step = USER_STATES[uid]["step"]
+    if step >= len(PLACEMENT_QUESTIONS):
+        await _finish_placement(update_or_query, uid)
+        return
+
+    q = PLACEMENT_QUESTIONS[step]
+    keyboard = [
+        [InlineKeyboardButton(opt, callback_data=f"place_{step}_{i}")]
+        for i, opt in enumerate(q["opts"])
+    ]
+    text = f"📝 Frage {step + 1}/{len(PLACEMENT_QUESTIONS)}\n\n{q['q']}"
+    
+    if hasattr(update_or_query, 'message'):
+        await update_or_query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update_or_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def _finish_placement(update_or_query, uid: int):
+    user = USER_STATES[uid]
+    score = user["score"]
+    total = len(PLACEMENT_QUESTIONS)
+    pct = score / total * 100
+
+    if pct >= 85: level = "B1"
+    elif pct >= 60: level = "A2"
+    elif pct >= 30: level = "A1"
+    else: level = "A0"
+
+    user["level"] = level
+    user["state"] = "idle"
+
+    # Update backend
+    _api("POST", "/api/placement/answer", {
+        "user_id": user["user_id"],
+        "score": score,
+        "total": total,
+        "level": level,
+    })
+
+    msg = f"✅ Einstufungstest abgeschlossen!\n\nDein Niveau: *{level}*\n({score}/{total} richtig)"
+    if hasattr(update_or_query, 'message'):
+        await update_or_query.message.reply_text(msg, parse_mode="Markdown")
+    else:
+        await update_or_query.edit_message_text(msg, parse_mode="Markdown")
+
+
+# ── Lektion flow ────────────────────────────────────────────────────────────
+
+async def leccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = USER_STATES.get(uid)
+    if not user:
+        await update.message.reply_text("Bitte zuerst /start")
+        return
+
+    # Get next lesson from backend
+    lesson = _api("GET", "/api/lessons/next")
+    if not lesson:
+        await update.message.reply_text("Keine neue Lektion verfügbar. Nutze /review für Wiederholungen!")
+        return
+
+    user["state"] = "lesson_warmup"
+    user["data"] = lesson
+    user["step"] = 0
+
+    await update.message.reply_text(
+        f"📖 *{lesson['title']}*\nLevel: {lesson['level']} | Unit: {lesson['unit']}\n\n"
+        f"Die Lektion hat 3 Teile:\n1️⃣ Warmup (SRS-Review)\n2️⃣ Neue Vokabeln\n3️⃣ Grammatik\n\n"
+        f"Lass uns starten! 🚀",
+        parse_mode="Markdown",
+    )
+    # Start warmup
+    await _start_warmup(update, uid)
+
+
+async def _start_warmup(update: Update, uid: int):
+    user = USER_STATES[uid]
+    user["state"] = "lesson_warmup"
+    user["step"] = 0
+
+    due = _api("GET", f"/api/users/{user['user_id']}/context")
+    due_words = due.get("due_words", []) if due else []
+
+    if not due_words:
+        user["state"] = "lesson_vocab"
+        await update.message.reply_text("Keine fälligen Reviews — direkt zu neuen Vokabeln! 📝")
+        return
+
+    user["data"]["due_words"] = due_words
+    await _send_warmup_word(update, uid)
+
+
+async def _send_warmup_word(update: Update, uid: int):
+    user = USER_STATES[uid]
+    step = user["step"]
+    words = user["data"].get("due_words", [])
+
+    if step >= len(words):
+        user["state"] = "lesson_vocab"
+        user["step"] = 0
+        await update.message.reply_text(
+            f"✅ Warmup abgeschlossen! ({len(words)} Vokabeln)\n\nJetzt: Neue Vokabeln lernen!",
+        )
+        return
+
+    word = words[step]
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔴 Again", callback_data=f"srs_{word['id']}_1"),
+         InlineKeyboardButton("🟠 Hard", callback_data=f"srs_{word['id']}_2")],
+        [InlineKeyboardButton("🟢 Good", callback_data=f"srs_{word['id']}_3"),
+         InlineKeyboardButton("🔵 Easy", callback_data=f"srs_{word['id']}_4")],
+    ])
+    await update.message.reply_text(
+        f"🔄 Review {step + 1}/{len(words)}\n\n*{word['spanish']}*",
+        reply_markup=keyboard, parse_mode="Markdown",
+    )
+
+
+# ── SRS review ──────────────────────────────────────────────────────────────
+
+async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = USER_STATES.get(uid)
+    if not user:
+        await update.message.reply_text("Bitte zuerst /start")
+        return
+
+    due = _api("GET", f"/api/users/{user['user_id']}/context")
+    due_words = due.get("due_words", []) if due else []
+
+    if not due_words:
+        await update.message.reply_text("🎉 Keine fälligen Vokabeln! Alles im Griff.")
+        return
+
+    user["state"] = "review"
+    user["step"] = 0
+    user["data"]["due_words"] = due_words
+    await update.message.reply_text(f"📚 {len(due_words)} fällige Vokabeln. Los geht's!")
+    await _send_warmup_word(update, uid)
+
+
+# ── Callback handler ─────────────────────────────────────────────────────────
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    uid = update.effective_user.id
     data = query.data
-    user = update.effective_user
 
-    if data.startswith("cmd_"):
-        cmd = data[4:]
-        if cmd == "leccion":
-            await leccion(update, context)
-        elif cmd == "review":
-            await review(update, context)
-        elif cmd == "progreso":
-            await progreso(update, context)
-        elif cmd == "placement":
-            await query.message.reply_text("Einstufungstest: /test")
-        return
+    if data.startswith("place_"):
+        await _handle_placement(query, uid, data)
+    elif data.startswith("srs_"):
+        await _handle_srs(query, uid, data)
 
-    if data.startswith("rate_"):
-        rating = int(data.split("_")[1])
-        user_state = USER_STATES.get(user.id, {})
-        queue = user_state.get("review_queue", [])
-        idx = user_state.get("review_index", 0)
 
-        if idx < len(queue):
-            word = queue[idx]
-            await api_request("POST", f"/api/vocab/review?user_id={user.id}", json={
-                "word_id": word["word_id"],
-                "rating": rating,
-            })
+async def _handle_placement(query, uid: int, data: str):
+    _, step_str, ans_str = data.split("_")
+    step = int(step_str)
+    answer = int(ans_str)
+    correct = PLACEMENT_QUESTIONS[step]["ans"]
 
-            idx += 1
-            user_state["review_index"] = idx
+    user = USER_STATES[uid]
+    if answer == correct:
+        user["score"] += 1
+    user["step"] = step + 1
+    await _send_placement_question(query, uid)
 
-            if idx < len(queue):
-                next_word = queue[idx]
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("Wieder (1)", callback_data="rate_1"),
-                    InlineKeyboardButton("Schwer (2)", callback_data="rate_2"),
-                    InlineKeyboardButton("Gut (3)", callback_data="rate_3"),
-                    InlineKeyboardButton("Leicht (4)", callback_data="rate_4"),
-                ]])
-                await query.edit_message_text(
-                    f"*{next_word['spanish']}*\n\n_({next_word['german']})_\n\nWie gut kanntest du das Wort?",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=keyboard,
-                )
-            else:
-                await query.edit_message_text("Review fertig! Gut gemacht.")
-                user_state.pop("review_queue", None)
-                user_state.pop("review_index", None)
 
-        return
+async def _handle_srs(query, uid: int, data: str):
+    _, word_id_str, rating_str = data.split("_")
+    word_id = int(word_id_str)
+    rating = int(rating_str)
 
-    if data.startswith("complete|"):
-        lesson_id = int(data.split("|")[1])
-        await api_request("POST", f"/api/lessons/{lesson_id}/complete?user_id={user.id}", json={
-            "score": 100,
-            "time_spent": 120,
+    user = USER_STATES[uid]
+    if user.get("user_id"):
+        _api("POST", "/api/vocab/review", {
+            "user_id": user["user_id"],
+            "word_id": word_id,
+            "rating": rating,
         })
-        await query.edit_message_text(query.message.text + "\n\n*Lektion abgeschlossen!*", parse_mode=ParseMode.MARKDOWN)
 
-    if data.startswith("explain|"):
-        lesson_id = int(data.split("|")[1])
-        lesson = await api_request("GET", f"/api/lessons/{lesson_id}")
-        content = lesson.get("content", {})
-
-        messages = [
-            {"role": "system", "content": "Du bist ein hilfreicher Spanisch-Lehrer. Erklaere die folgende Lektion auf Deutsch."},
-            {"role": "user", "content": f"Erklaere diese Spanisch-Lektion: {json.dumps(content, ensure_ascii=False)}"},
-        ]
-        explanation = await llm_chat(messages)
-        await query.message.reply_text(explanation)
-
-    if data == "grammar_next":
-        await gramatica(update, context)
+    user["step"] += 1
+    if user["state"] == "lesson_warmup":
+        await _send_warmup_word(query, uid)
+    elif user["state"] == "review":
+        await _send_warmup_word(query, uid)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_state = USER_STATES.get(user.id, {})
+# ── Conversation / Grammar via Hermes (skeleton) ────────────────────────────
 
-    if user_state.get("conversation_mode"):
-        user_msg = update.message.text
-        history = user_state.get("conversation_history", [])
-        history.append({"role": "user", "content": user_msg})
+async def hablar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "💬 *Konversations-Modus*\n\n"
+        "Schreib mir auf Spanisch und ich korrigiere dich! "
+        "Hermes (dein KI-Spanischlehrer) übernimmt gleich.\n\n"
+        "_Phase 3: Hermes-Integration folgt in Kürze._",
+        parse_mode="Markdown",
+    )
 
-        await update.message.chat.send_action("typing")
-        reply = await llm_chat(history)
-        history.append({"role": "assistant", "content": reply})
-        user_state["conversation_history"] = history[-12:]
 
-        await update.message.reply_text(reply)
+async def gramatica(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = USER_STATES.get(uid)
+    level = user["level"] if user else "A1"
 
+    grammar = _api("GET", f"/api/grammar/{level}")
+    if grammar and isinstance(grammar, list) and grammar:
+        g = grammar[0]
+        await update.message.reply_text(
+            f"📖 *{g['title']}* ({level})\n\n{g['explanation']}\n\n"
+            f"Mehr Grammatik: Hermes erklärt live in Kürze!",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            "Grammatik-Erklärungen folgen in Phase 3 via Hermes!",
+        )
+
+
+# ── Text handler ────────────────────────────────────────────────────────────
+
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    text = update.message.text.strip() if update.message.text else ""
+
+    if not text:
+        return
+
+    # Check for Spanish text in conversation mode
+    user = USER_STATES.get(uid)
+    if user and user.get("state") == "conversation":
+        await update.message.reply_text(
+            f"📝 _Deine Nachricht:_ {text}\n\n"
+            "_Hermes-Konversation folgt in Phase 3._",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            "Nutze /help um die Kommandos zu sehen.",
+        )
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Commands
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("leccion", leccion))
     app.add_handler(CommandHandler("review", review))
     app.add_handler(CommandHandler("gramatica", gramatica))
     app.add_handler(CommandHandler("hablar", hablar))
     app.add_handler(CommandHandler("progreso", progreso))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Spanish bot starting...")
+    # Callbacks (inline keyboard)
+    app.add_handler(CallbackQueryHandler(on_callback))
+
+    # Messages
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+
     app.run_polling()
 
 
