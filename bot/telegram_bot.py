@@ -104,7 +104,7 @@ async def progreso(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Bitte zuerst /start")
         return
 
-    stats = _api("GET", f"/api/stats/{user['user_id']}")
+    stats = _api("GET", f"/api/users/{user['user_id']}/stats")
     if not stats:
         await update.message.reply_text("Statistik nicht verfügbar.")
         return
@@ -199,7 +199,7 @@ async def leccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Get next lesson from backend
-    lesson = _api("GET", "/api/lessons/next")
+    lesson = _api("GET", f"/api/lessons/next?user_id={user['user_id']}")
     if not lesson:
         await update.message.reply_text("Keine neue Lektion verfügbar. Nutze /review für Wiederholungen!")
         return

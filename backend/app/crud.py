@@ -343,6 +343,113 @@ async def get_stats(db: AsyncSession, user_id: int):
     }
 
 
+async def check_level_progression(db: AsyncSession, user_id: int) -> dict | None:
+    """Prüft ob der User das aktuelle Level gemeistert hat und aufsteigen kann.
+    
+    Kriterien:
+    - ≥80% der Wörter des aktuellen Levels sind "stabil" (FSRS stability > 21 Tage)
+    - Mindestens 3 Lektionen des aktuellen Levels abgeschlossen
+    - Mindestens 1 Konversation (vocab source = "conversation") vorhanden
+    
+    Returns: {"can_advance": bool, "new_level": str, "stats": dict} or None
+    """
+    user = await db.get(User, user_id)
+    if not user:
+        return None
+
+    level_order = {"A0": 0, "A1": 1, "A2": 2, "B1": 3, "B2": 4}
+    current_idx = level_order.get(user.current_level, 0)
+    
+    # Count words at current level
+    result = await db.execute(
+        select(func.count()).select_from(Word).where(Word.level == user.current_level)
+    )
+    total_words_at_level = result.scalar() or 0
+    if total_words_at_level == 0:
+        return {"can_advance": False, "current_level": user.current_level, "stats": {}}
+
+    # Count stable words (FSRS stability > 21 days)
+    result = await db.execute(
+        select(func.count())
+        .select_from(UserWord)
+        .join(Word, UserWord.word_id == Word.id)
+        .where(
+            UserWord.user_id == user_id,
+            Word.level == user.current_level,
+            UserWord.state == 2,
+            UserWord.stability > 21,
+        )
+    )
+    stable_words = result.scalar() or 0
+    word_pct = stable_words / total_words_at_level * 100 if total_words_at_level else 0
+
+    # Count completed lessons at current level
+    result = await db.execute(
+        select(func.count())
+        .select_from(UserLesson)
+        .join(Lesson, UserLesson.lesson_id == Lesson.id)
+        .where(
+            UserLesson.user_id == user_id,
+            Lesson.level == user.current_level,
+        )
+    )
+    lessons_completed = result.scalar() or 0
+
+    # Count conversation-based vocabulary
+    result = await db.execute(
+        select(func.count()).select_from(UserWord).where(
+            UserWord.user_id == user_id,
+            UserWord.source == "conversation",
+        )
+    )
+    convos = result.scalar() or 0
+
+    # Count due words (indicates remaining work)
+    result = await db.execute(
+        select(func.count())
+        .select_from(UserWord)
+        .join(Word, UserWord.word_id == Word.id)
+        .where(
+            UserWord.user_id == user_id,
+            Word.level == user.current_level,
+            UserWord.next_review <= date.today().isoformat(),
+        )
+    )
+    due_words = result.scalar() or 0
+
+    stats = {
+        "total_words_at_level": total_words_at_level,
+        "stable_words": stable_words,
+        "stable_pct": round(word_pct, 1),
+        "lessons_completed": lessons_completed,
+        "conversation_words": convos,
+        "words_due": due_words,
+    }
+
+    can_advance = word_pct >= 80 and lessons_completed >= 3
+
+    new_level = None
+    if can_advance:
+        next_levels = {"A0": "A1", "A1": "A2", "A2": "B1", "B1": "B2", "B2": None}
+        new_level = next_levels.get(user.current_level)
+        if new_level:
+            user.current_level = new_level
+            user.xp += 100
+            await db.commit()
+
+    return {
+        "can_advance": can_advance,
+        "current_level": user.current_level,
+        "new_level": new_level,
+        "stats": stats,
+        "next_words": total_words_at_level - stable_words,
+        "missing": {
+            "words_needed": max(0, int(total_words_at_level * 0.8) - stable_words),
+            "lessons_needed": max(0, 3 - lessons_completed),
+        },
+    }
+
+
 def _update_streak(user: User):
     today = date.today().isoformat()
     if user.last_active_date == today:
