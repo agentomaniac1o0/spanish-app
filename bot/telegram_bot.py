@@ -295,10 +295,16 @@ async def _send_translation(update_or_query, uid: int):
 
     w = words[step]
     direction = "ES_DE" if step > 0 and step % 4 == 0 else "DE_ES"
+    # Every 3rd word: picture description mode
+    picture_mode = step > 1 and step % 3 == 0
+
     u["data"]["_cur"] = w
     u["data"]["_dir"] = direction
+    u["data"]["_pic"] = picture_mode
 
-    if direction == "DE_ES":
+    if picture_mode:
+        prompt = f"🖼️ {step+1}/{len(words)}\n\n¿Qué ves en esta imagen?\n_Beschreibe auf Spanisch was du siehst!_"
+    elif direction == "DE_ES":
         prompt = f"✏️ {step+1}/{len(words)}\n\nWie heißt *\"{w.get('german','')}\"* auf Spanisch?"
     else:
         prompt = f"✏️ {step+1}/{len(words)}\n\nWas bedeutet *\"{w.get('spanish','')}\"*?"
@@ -307,6 +313,18 @@ async def _send_translation(update_or_query, uid: int):
         await update_or_query.message.reply_text(prompt, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
     else:
         await update_or_query.edit_message_text(prompt, parse_mode="Markdown")
+
+    # Send unit image for picture mode
+    unit = w.get("unit", "")
+    if picture_mode and unit:
+        try:
+            img_data = httpx.get(f"{BACKEND_URL}/static/units/unit_{unit}.jpg", timeout=5).content
+            if hasattr(update_or_query, 'message'):
+                await update_or_query.message.reply_photo(img_data, caption="🇪🇸 ¡Descríbeme esta imagen!")
+            else:
+                await update_or_query.message.reply_photo(img_data, caption="🇪🇸 ¡Descríbeme esta imagen!")
+        except Exception:
+            pass
 
 
 # ── Text handler: SRS numbers + translation answers ─────────────────────────
@@ -339,8 +357,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state in ("lesson_translate", "review"):
         w = u["data"].get("_cur", {})
         direction = u["data"].get("_dir", "DE_ES")
+        is_picture = u["data"].get("_pic", False)
 
-        if direction == "DE_ES":
+        if is_picture:
+            # Picture mode: any Spanish text is good, just encourage!
+            u["score"] += 1
+            await update.message.reply_text(
+                f"🖼️ ¡Muy bien! Dein Spanisch: *{text}*\n({u['score']}/{u['step']+1})",
+                parse_mode="Markdown")
+        elif direction == "DE_ES":
             correct = w.get("spanish", "")
             ok, fb = _check_translation(text, correct)
         else:
