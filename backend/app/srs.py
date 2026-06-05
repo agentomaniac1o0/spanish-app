@@ -37,15 +37,6 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def _date_diff(d1: str, d2: str) -> float:
-    try:
-        dt1 = datetime.fromisoformat(d1).date()
-        dt2 = datetime.fromisoformat(d2).date()
-        return (dt2 - dt1).days
-    except (ValueError, TypeError):
-        return 0.0
-
-
 def initial_stability(rating: int) -> float:
     if rating == RATING_AGAIN:
         return 0.0

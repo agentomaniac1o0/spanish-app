@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import crud
 from app.database import get_db
-from app.schemas import PlacementQuestion, PlacementResult
+from app.schemas import PlacementResult
 
 router = APIRouter(prefix="/placement", tags=["placement"])
 

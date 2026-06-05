@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -7,6 +8,8 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import async_session, init_db
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -14,9 +17,13 @@ async def lifespan(app: FastAPI):
     from app.crud import seed_database
 
     async with async_session() as db:
+        logger.info("Seeding database...")
         await seed_database(db)
+        logger.info("Database seed complete")
     yield
 
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
 app = FastAPI(title="Spanish Learning Backend", version="0.1.0", lifespan=lifespan)
 

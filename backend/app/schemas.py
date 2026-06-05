@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict
@@ -34,18 +34,6 @@ class UserProgress(BaseModel):
     total_lessons: int
 
 
-class WordRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-    id: int
-    spanish: str
-    german: str
-    word_type: str
-    level: str
-    unit: str
-    example_sentence: Optional[str]
-    example_translation: Optional[str]
-
-
 class UserWordRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     word_id: int
@@ -68,12 +56,6 @@ class PlacementQuestion(BaseModel):
     options: list[str]
     correct_index: int
     level_hint: str
-
-
-class PlacementAnswer(BaseModel):
-    question_id: int
-    chosen_index: int
-    response_time_ms: int
 
 
 class PlacementResult(BaseModel):

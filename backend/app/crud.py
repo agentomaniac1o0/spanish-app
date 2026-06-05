@@ -2,7 +2,7 @@ import json
 from datetime import date
 from typing import Optional
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.curriculum import GRAMMAR_POINTS, LESSONS, PLACEMENT_QUESTIONS, WORDS
@@ -128,11 +128,6 @@ async def assign_words_to_user(db: AsyncSession, user_id: int, word_ids: list[in
             uw = UserWord(user_id=user_id, word_id=wid, **card)
             db.add(uw)
     await db.commit()
-
-
-async def get_words_by_lesson(db: AsyncSession, lesson_id: int):
-    result = await db.execute(select(Word))
-    return result.scalars().all()
 
 
 async def get_next_lesson(db: AsyncSession, user_id: int):

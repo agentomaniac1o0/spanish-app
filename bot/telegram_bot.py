@@ -1,9 +1,14 @@
 """
 Spanish Learning Telegram Bot — @spanishdudebot
 """
-import os, re, json, httpx, random
+import logging
+import os
+import httpx
 from dotenv import load_dotenv
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+logger = logging.getLogger(__name__)
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardRemove
 from telegram.ext import (
@@ -27,7 +32,8 @@ def _api(method: str, path: str, body: dict | None = None) -> dict | None:
         if r.status_code == 200:
             return r.json()
         return None
-    except Exception:
+    except Exception as e:
+        logger.error("API call failed: %s %s — %s", method, url, e)
         return None
 
 
@@ -205,8 +211,8 @@ async def leccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             img_data = httpx.get(f"{BACKEND_URL}/static/units/unit_{unit_name}.jpg", timeout=5).content
             await update.message.reply_photo(img_data, caption=f"📖 Unit: {unit_name}")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Unit image load failed: %s", e)
 
     await _send_srs(update, uid)
 
@@ -239,8 +245,8 @@ async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             img_data = httpx.get(f"{BACKEND_URL}/static/units/unit_{unit_name}.jpg", timeout=5).content
             await update.message.reply_photo(img_data, caption=f"📖 Unit: {unit_name}")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Unit image load failed: %s", e)
     await _send_translation(update, uid)
 
 
@@ -323,8 +329,8 @@ async def _send_translation(update_or_query, uid: int):
                 await update_or_query.message.reply_photo(img_data, caption="🇪🇸 ¡Descríbeme esta imagen!")
             else:
                 await update_or_query.message.reply_photo(img_data, caption="🇪🇸 ¡Descríbeme esta imagen!")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Unit image load failed: %s", e)
 
 
 # ── Text handler: SRS numbers + translation answers ─────────────────────────
@@ -403,7 +409,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     filename=f"{w.get('spanish','')}.mp3"
                 )
             except Exception as e:
-                pass
+                logger.warning("Audio send failed: %s", e)
 
         u["step"] += 1
         await _send_translation(update, uid)
@@ -460,6 +466,22 @@ async def hablar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("💬 Hermes-Konversation folgt in Phase 3!")
 
 
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    u = USER_STATES.get(uid)
+    if u:
+        u["state"] = "idle"
+        u["step"] = 0
+        u["data"] = {}
+    await update.message.reply_text(
+        "⏹️ *Lektion beendet.*\n\n"
+        "Dein Fortschritt wurde gespeichert.\n"
+        "/leccion — Neue Lektion\n"
+        "/review — Wiederholen\n"
+        "/progreso — Statistik",
+        parse_mode="Markdown")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -471,6 +493,7 @@ def main():
     app.add_handler(CommandHandler("gramatica", gramatica))
     app.add_handler(CommandHandler("hablar", hablar))
     app.add_handler(CommandHandler("progreso", progreso))
+    app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.run_polling()
