@@ -337,17 +337,24 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _api("POST", "/api/vocab/review", {"user_id": u["user_id"], "word_id": wid, "rating": 4})
         else:
             await update.message.reply_text(f"❌ {fb}", parse_mode="Markdown")
+            # Record wrong answer so it reappears in next review
+            wid = w.get("word_id") or w.get("id", 0)
+            if u.get("user_id") and wid:
+                _api("POST", "/api/vocab/review", {"user_id": u["user_id"], "word_id": wid, "rating": 1})
 
-        # Send audio AFTER answer (reinforcement)
+        # Send audio AFTER answer (reinforcement) — must upload file, not URL (Tailscale IP not public)
         wid = w.get("word_id") or w.get("id", 0)
         if wid:
             try:
+                audio_url = f"{BACKEND_URL}/static/audio/{wid}.mp3"
+                audio_data = httpx.get(audio_url, timeout=5).content
                 await update.message.reply_audio(
-                    f"{BACKEND_URL}/static/audio/{wid}.mp3",
+                    audio_data,
                     title=w.get('spanish',''),
-                    caption=f"🔊 {w.get('spanish','')}"
+                    caption=f"🔊 {w.get('spanish','')}",
+                    filename=f"{w.get('spanish','')}.mp3"
                 )
-            except Exception:
+            except Exception as e:
                 pass
 
         u["step"] += 1
