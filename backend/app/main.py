@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.database import async_session, init_db
@@ -53,3 +54,5 @@ app.include_router(placement.router, prefix="/api")
 app.include_router(lessons.router, prefix="/api")
 app.include_router(vocab.router, prefix="/api")
 app.include_router(conversation.router, prefix="/api")
+
+app.mount("/static", StaticFiles(directory="static"), name="static")

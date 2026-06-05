@@ -354,6 +354,15 @@ async def _send_translation(update_or_query, uid: int):
     else:
         await update_or_query.edit_message_text(prompt, parse_mode="Markdown")
 
+    # Send audio with native speaker voice
+    word_id = word.get("id") or word.get("word_id")
+    if word_id:
+        audio_url = f"{BACKEND_URL}/static/audio/{word_id}.mp3"
+        if hasattr(update_or_query, 'message'):
+            await update_or_query.message.reply_audio(audio_url, title=word['spanish'])
+        else:
+            await update_or_query.message.reply_audio(audio_url, title=word['spanish'])
+
 
 async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Review mode: translation exercises for all due words."""

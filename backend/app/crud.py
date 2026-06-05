@@ -73,6 +73,7 @@ async def get_due_words(db: AsyncSession, user_id: int, limit: int = 10):
             "stability": uw.stability,
             "difficulty": uw.difficulty,
             "next_review": uw.next_review,
+            "audio_url": f"/static/audio/{word.id}.mp3",
         }
         for uw, word in rows
     ]
