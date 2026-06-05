@@ -290,17 +290,6 @@ async def _send_translation(update_or_query, uid: int):
     else:
         await update_or_query.edit_message_text(prompt, parse_mode="Markdown")
 
-    # Send audio
-    wid = w.get("word_id") or w.get("id", 0)
-    if wid:
-        try:
-            if hasattr(update_or_query, 'message'):
-                await update_or_query.message.reply_audio(f"{BACKEND_URL}/static/audio/{wid}.mp3", title=w.get('spanish',''))
-            else:
-                await update_or_query.message.reply_audio(f"{BACKEND_URL}/static/audio/{wid}.mp3", title=w.get('spanish',''))
-        except Exception:
-            pass
-
 
 # ── Text handler: SRS numbers + translation answers ─────────────────────────
 
@@ -348,6 +337,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _api("POST", "/api/vocab/review", {"user_id": u["user_id"], "word_id": wid, "rating": 4})
         else:
             await update.message.reply_text(f"❌ {fb}", parse_mode="Markdown")
+
+        # Send audio AFTER answer (reinforcement)
+        wid = w.get("word_id") or w.get("id", 0)
+        if wid:
+            try:
+                await update.message.reply_audio(
+                    f"{BACKEND_URL}/static/audio/{wid}.mp3",
+                    title=w.get('spanish',''),
+                    caption=f"🔊 {w.get('spanish','')}"
+                )
+            except Exception:
+                pass
 
         u["step"] += 1
         await _send_translation(update, uid)
