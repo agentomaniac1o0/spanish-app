@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import crud
@@ -21,6 +22,48 @@ async def review_word(data: UserWordReview, db: AsyncSession = Depends(get_db)):
     if result is None:
         return {"detail": "Wort nicht gefunden"}
     return result
+
+
+@router.post("/assign")
+async def assign_words(data: dict, db: AsyncSession = Depends(get_db)):
+    """Assigns random new words to a user at their level. Used when user has no due words."""
+    user_id = data.get("user_id")
+    level = data.get("level", "A0")
+    count = data.get("count", 10)
+
+    if not user_id:
+        return {"detail": "user_id required"}
+
+    # Get words at user's level that aren't yet assigned
+    result = await db.execute(
+        select(Word).where(
+            Word.level == level,
+            ~Word.id.in_(
+                select(UserWord.word_id).where(UserWord.user_id == user_id)
+            )
+        ).order_by(func.random()).limit(count)
+    )
+    words = result.scalars().all()
+
+    assigned = []
+    for word in words:
+        # Check if UserWord already exists
+        result = await db.execute(
+            select(UserWord).where(UserWord.user_id == user_id, UserWord.word_id == word.id)
+        )
+        if result.scalar_one_or_none() is None:
+            card = seeding_card(word.id)
+            card.pop("word_id", None)
+            uw = UserWord(user_id=user_id, word_id=word.id, source="lesson", **card)
+            db.add(uw)
+            assigned.append({
+                "word_id": word.id,
+                "spanish": word.spanish,
+                "german": word.german,
+            })
+
+    await db.commit()
+    return {"words": assigned, "count": len(assigned)}
 
 
 @router.post("/add")
