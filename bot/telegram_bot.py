@@ -366,11 +366,21 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_picture = u["data"].get("_pic", False)
 
         if is_picture:
-            # Picture mode: any Spanish text is good, just encourage!
-            u["score"] += 1
-            await update.message.reply_text(
-                f"🖼️ ¡Muy bien! Dein Spanisch: *{text}*\n({u['score']}/{u['step']+1})",
-                parse_mode="Markdown")
+            correct = w.get("spanish", "")
+            ok, fb = _check_translation(text, correct)
+            if ok:
+                u["score"] += 1
+                await update.message.reply_text(
+                    f"🖼️ ¡Correcto! ({u['score']}/{u['step']+1})",
+                    parse_mode="Markdown")
+                wid = w.get("word_id") or w.get("id", 0)
+                if u.get("user_id") and wid:
+                    _api("POST", "/api/vocab/review", {"user_id": u["user_id"], "word_id": wid, "rating": 4})
+            else:
+                await update.message.reply_text(
+                    f"🖼️ Fast! Richtig: *{correct}* — _\"{w.get('german', '')}\"_\n"
+                    f"Deine Antwort: {text}",
+                    parse_mode="Markdown")
         elif direction == "DE_ES":
             correct = w.get("spanish", "")
             ok, fb = _check_translation(text, correct)
@@ -378,23 +388,22 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             correct = w.get("german", "")
             ok, fb = _check_translation(text, correct)
 
-        if ok:
-            u["score"] += 1
-            await update.message.reply_text(f"✅ ¡Correcto! ({u['score']}/{u['step']+1})", parse_mode="Markdown")
-            wid = w.get("word_id") or w.get("id", 0)
-            if u.get("user_id") and wid:
-                _api("POST", "/api/vocab/review", {"user_id": u["user_id"], "word_id": wid, "rating": 4})
-        else:
-            await update.message.reply_text(f"❌ {fb}", parse_mode="Markdown")
-            # Record for FSRS (will reappear tomorrow)
-            wid = w.get("word_id") or w.get("id", 0)
-            if u.get("user_id") and wid:
-                _api("POST", "/api/vocab/review", {"user_id": u["user_id"], "word_id": wid, "rating": 1})
-            # Also re-add to current session for immediate re-practice (max once)
-            w_copy = dict(w)
-            w_copy["_retry"] = w.get("_retry", 0) + 1
-            if w_copy["_retry"] <= 2:
-                u["data"]["lesson_words"].append(w_copy)
+        if not is_picture:
+            if ok:
+                u["score"] += 1
+                await update.message.reply_text(f"✅ ¡Correcto! ({u['score']}/{u['step']+1})", parse_mode="Markdown")
+                wid = w.get("word_id") or w.get("id", 0)
+                if u.get("user_id") and wid:
+                    _api("POST", "/api/vocab/review", {"user_id": u["user_id"], "word_id": wid, "rating": 4})
+            else:
+                await update.message.reply_text(f"❌ {fb}", parse_mode="Markdown")
+                wid = w.get("word_id") or w.get("id", 0)
+                if u.get("user_id") and wid:
+                    _api("POST", "/api/vocab/review", {"user_id": u["user_id"], "word_id": wid, "rating": 1})
+                w_copy = dict(w)
+                w_copy["_retry"] = w.get("_retry", 0) + 1
+                if w_copy["_retry"] <= 2:
+                    u["data"]["lesson_words"].append(w_copy)
 
         # Send audio AFTER answer (reinforcement) — must upload file, not URL (Tailscale IP not public)
         wid = w.get("word_id") or w.get("id", 0)
