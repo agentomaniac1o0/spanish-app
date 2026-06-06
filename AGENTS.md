@@ -78,7 +78,15 @@ Ratings: 1=Again, 2=Hard, 3=Good, 4=Easy.
 | `HERMES_SSH_HOST` | Hermes SSH host | `192.168.0.144` |
 | `HERMES_SSH_USER` | Hermes SSH user | `hermes` |
 
-## Deployment
+## Deployment (LXC 106)
 
-See `deploy/` for systemd user unit files.
-Both services run as user `anton` on VM 101.
+- **Host:** `spanish-app` LXC 106 (192.168.0.130, Tailscale 100.91.254.59)
+- **Code path:** `/opt/spanish-app/` (deployed via scp from VM 101 `~/spanish-app/`)
+- **Systemd units (system):** `spanish-backend.service`, `spanish-bot.service`
+- **Backend URL in bot:** `http://100.91.254.59:8100` (Tailscale)
+- **Restart:** `ssh root@192.168.0.130 systemctl restart spanish-bot`
+
+## Known Issues
+
+- **Phase 3 (Hermes live-Grammatik + Konversation):** `/gramatica` und `/hablar` sind Platzhalter
+- **4 Unit-Bilder fehlen:** 28/32 Units illustriert
