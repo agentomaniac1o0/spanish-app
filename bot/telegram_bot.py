@@ -1,6 +1,7 @@
 """
 Spanish Learning Telegram Bot — @spanishdudebot
 """
+import asyncio
 import logging
 import os
 import httpx
@@ -15,6 +16,8 @@ from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler,
     MessageHandler, filters, ContextTypes,
 )
+
+from image_gen import generate_word_image, word_image_exists
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://100.91.254.59:8100")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -56,11 +59,8 @@ def _check_translation(user_input: str, correct: str) -> tuple[bool, str]:
 
 
 def _load_words(user_id: int, level: str, count: int = 10) -> list[dict]:
-    """Load due words from SRS. Only assign new words if queue is empty."""
     ctx = _api("GET", f"/api/users/{user_id}/context")
     words = ctx.get("due_words", []) if ctx else []
-    
-    # If not enough due words, top up with new ones
     if len(words) < count:
         needed = count - len(words)
         resp = _api("POST", "/api/vocab/assign", {
@@ -68,8 +68,68 @@ def _load_words(user_id: int, level: str, count: int = 10) -> list[dict]:
         })
         if resp and resp.get("words"):
             words.extend(resp["words"])
-    
     return words[:count]
+
+
+def _load_review_words(user_id: int, level: str) -> list[dict]:
+    """Load words for /review: due words + previously failed words, filtered by level, no new assignments."""
+    ctx = _api("GET", f"/api/users/{user_id}/context")
+    due = ctx.get("due_words", []) if ctx else []
+
+    max_level = "A1" if level in ("A0", "A1") else "A2"
+    failed = _api("GET", f"/api/vocab/failed?user_id={user_id}&max_level={max_level}&limit=15")
+    failed = failed if failed else []
+
+    word_ids = set()
+    words = []
+    for w in due + failed:
+        wid = w.get("word_id", 0)
+        if wid and wid not in word_ids:
+            word_ids.add(wid)
+            words.append(w)
+
+    if not words:
+        due_all = _api("GET", f"/api/vocab/due?user_id={user_id}&limit=10")
+        if due_all:
+            words = due_all
+
+    return words[:10]
+
+
+def _get_picture_words(words: list[dict]) -> list[dict]:
+    """Return words that will trigger picture mode (every 3rd starting from index 2)."""
+    return [w for i, w in enumerate(words) if i > 1 and i % 3 == 0]
+
+
+async def _build_lesson_plan(update: Update, uid: int, user_id: int, level: str) -> dict | None:
+    """Load words and pre-generate any missing images. Show progress in chat."""
+    words = _load_words(user_id, level, 10)
+    if not words:
+        return None
+
+    picture_words = _get_picture_words(words)
+    missing = [w for w in picture_words if w.get("word_id") and not word_image_exists(w["word_id"])]
+
+    if missing:
+        msg = await update.message.reply_text(
+            f"🎨 *Erstelle Bilder...* (0/{len(missing)})",
+            parse_mode="Markdown")
+        for i, w in enumerate(missing):
+            try:
+                await msg.edit_text(
+                    f"🎨 *Erstelle Bilder...* ({i+1}/{len(missing)})\n"
+                    f"_Zeichne: {w['spanish']} — {w.get('german','')}_",
+                    parse_mode="Markdown")
+                ok = await asyncio.to_thread(
+                    generate_word_image, w["word_id"], w["spanish"], w.get("german", ""),
+                    upload_stock=True)
+                if not ok:
+                    logger.warning("Bild fehlgeschlagen: %s (%d)", w["spanish"], w["word_id"])
+            except Exception as e:
+                logger.error("Bild-Generierung abgebrochen: %s", e)
+        await msg.edit_text("✅ *Bilder fertig!* Los geht's!", parse_mode="Markdown")
+
+    return {"words": words, "picture_words": picture_words, "missing": missing}
 
 
 # ── Commands ─────────────────────────────────────────────────────────────────
@@ -109,7 +169,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/hablar — Konversation\n"
         "/progreso — Statistik\n\n"
         "✏️ Übersetzen: Einfach die Antwort tippen!\n"
-        "🔊 Jede Vokabel hat ein Audio (Muttersprachler)",
+        "🔊 Audio: Button neben der Antwort drücken",
         parse_mode="Markdown")
 
 
@@ -186,12 +246,12 @@ async def leccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not u:
         await update.message.reply_text("Bitte zuerst /start"); return
 
-    words = _load_words(u["user_id"], u["level"], 10)
-    if not words:
+    plan = await _build_lesson_plan(update, uid, u["user_id"], u["level"])
+    if not plan:
         await update.message.reply_text("Keine Wörter verfügbar. Bitte warte auf Curriculum-Update.")
         return
 
-    # Split: first 5 for SRS warmup, all 10 for translation
+    words = plan["words"]
     due_words = words[:5]
 
     u["state"] = "lesson_warmup"
@@ -199,12 +259,11 @@ async def leccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u["step"] = 0; u["score"] = 0
 
     await update.message.reply_text(
-        f"📚 Lektion ({u['level']})\n\n"
+        f"📚 *Lektion ({u['level']})*\n\n"
         f"1️⃣ SRS-Warmup: {len(due_words)} Wörter\n"
         f"2️⃣ Übersetzen: {len(words)} Wörter\n\n"
         f"Los geht's!", parse_mode="Markdown")
 
-    # Send unit image as header
     units = set(w.get("unit", "") for w in words if w.get("unit"))
     if units:
         unit_name = list(units)[0]
@@ -223,7 +282,7 @@ async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not u:
         await update.message.reply_text("Bitte zuerst /start"); return
 
-    words = _load_words(u["user_id"], u["level"], 10)
+    words = _load_review_words(u["user_id"], u["level"])
     if not words:
         await update.message.reply_text("🎉 Keine Vokabeln fällig! ¡Muy bien!\n\nNutze /leccion für neue Wörter.")
         return
@@ -233,12 +292,11 @@ async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u["step"] = 0; u["score"] = 0
 
     await update.message.reply_text(
-        f"📚 {len(words)} Vokabeln zum Üben!\n✏️ Schreib die Übersetzung.\n"
-        f"🔊 Tipp: Jede Vokabel kommt mit Audio.",
+        f"📚 *{len(words)} Vokabeln zum Üben!*\n"
+        f"✏️ Schreib die Übersetzung.\n"
+        f"🔊 Tipp: Audio-Button neben der Antwort drücken.",
         parse_mode="Markdown")
-    u["state"] = "review"
 
-    # Send unit image as header
     units = set(w.get("unit", "") for w in words if w.get("unit"))
     if units:
         unit_name = list(units)[0]
@@ -247,6 +305,7 @@ async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_photo(img_data, caption=f"📖 Unit: {unit_name}")
         except Exception as e:
             logger.warning("Unit image load failed: %s", e)
+
     await _send_translation(update, uid)
 
 
@@ -256,7 +315,6 @@ async def _send_srs(update_or_query, uid: int):
     words = u["data"].get("due_words", [])
 
     if step >= len(words):
-        # Move to translation phase
         u["state"] = "lesson_translate" if u["state"] == "lesson_warmup" else "review"
         u["step"] = 0
         msg = "✅ Warmup fertig!\n\n✏️ Jetzt übersetzen!"
@@ -291,7 +349,8 @@ async def _send_translation(update_or_query, uid: int):
 
     if step >= len(words):
         u["state"] = "idle"
-        msg = (f"🎉 Abgeschlossen!\n\nRichtig: *{u['score']}/{len(words)}*\n\n"
+        total = len(words)
+        msg = (f"🎉 *Abgeschlossen!*\n\nRichtig: *{u['score']}/{total}*\n\n"
                f"/leccion — Nächste Lektion\n/review — Wiederholen\n/progreso — Fortschritt")
         if hasattr(update_or_query, 'message'):
             await update_or_query.message.reply_text(msg, parse_mode="Markdown")
@@ -301,7 +360,6 @@ async def _send_translation(update_or_query, uid: int):
 
     w = words[step]
     direction = "ES_DE" if step > 0 and step % 4 == 0 else "DE_ES"
-    # Every 3rd word: picture description mode
     picture_mode = step > 1 and step % 3 == 0
 
     u["data"]["_cur"] = w
@@ -320,17 +378,31 @@ async def _send_translation(update_or_query, uid: int):
     else:
         await update_or_query.edit_message_text(prompt, parse_mode="Markdown")
 
-    # Send unit image for picture mode
-    unit = w.get("unit", "")
-    if picture_mode and unit:
-        try:
-            img_data = httpx.get(f"{BACKEND_URL}/static/units/unit_{unit}.jpg", timeout=5).content
-            if hasattr(update_or_query, 'message'):
-                await update_or_query.message.reply_photo(img_data, caption="🇪🇸 ¡Descríbeme esta imagen!")
-            else:
-                await update_or_query.message.reply_photo(img_data, caption="🇪🇸 ¡Descríbeme esta imagen!")
-        except Exception as e:
-            logger.warning("Unit image load failed: %s", e)
+    # Send word-specific image for picture mode
+    if picture_mode:
+        wid = w.get("word_id", 0)
+        unit = w.get("unit", "")
+        img_sent = False
+        if wid:
+            try:
+                img_url = f"{BACKEND_URL}/static/words/word_{wid}.jpg"
+                img_data = httpx.get(img_url, timeout=5).content
+                if hasattr(update_or_query, 'message'):
+                    await update_or_query.message.reply_photo(img_data, caption="🇪🇸 ¡Descríbeme esta imagen!")
+                else:
+                    await update_or_query.message.reply_photo(img_data, caption="🇪🇸 ¡Descríbeme esta imagen!")
+                img_sent = True
+            except Exception as e:
+                logger.warning("Word image not found for %d: %s", wid, e)
+        if not img_sent and unit:
+            try:
+                img_data = httpx.get(f"{BACKEND_URL}/static/units/unit_{unit}.jpg", timeout=5).content
+                if hasattr(update_or_query, 'message'):
+                    await update_or_query.message.reply_photo(img_data, caption="🇪🇸 ¡Descríbeme esta imagen! (Unit)")
+                else:
+                    await update_or_query.message.reply_photo(img_data, caption="🇪🇸 ¡Descríbeme esta imagen! (Unit)")
+            except Exception as e:
+                logger.warning("Unit image fallback failed: %s", e)
 
 
 # ── Text handler: SRS numbers + translation answers ─────────────────────────
@@ -368,19 +440,21 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_picture:
             correct = w.get("spanish", "")
             ok, fb = _check_translation(text, correct)
+            wid = w.get("word_id") or w.get("id", 0)
             if ok:
                 u["score"] += 1
-                await update.message.reply_text(
-                    f"🖼️ ¡Correcto! ({u['score']}/{u['step']+1})",
-                    parse_mode="Markdown")
-                wid = w.get("word_id") or w.get("id", 0)
                 if u.get("user_id") and wid:
                     _api("POST", "/api/vocab/review", {"user_id": u["user_id"], "word_id": wid, "rating": 4})
+                kb = _audio_button(wid)
+                await update.message.reply_text(
+                    f"🖼️ ¡Correcto! ({u['score']}/{u['step']+1})",
+                    reply_markup=kb)
             else:
+                kb = _audio_button(wid)
                 await update.message.reply_text(
                     f"🖼️ Fast! Richtig: *{correct}* — _\"{w.get('german', '')}\"_\n"
                     f"Deine Antwort: {text}",
-                    parse_mode="Markdown")
+                    reply_markup=kb, parse_mode="Markdown")
         elif direction == "DE_ES":
             correct = w.get("spanish", "")
             ok, fb = _check_translation(text, correct)
@@ -389,36 +463,24 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ok, fb = _check_translation(text, correct)
 
         if not is_picture:
+            wid = w.get("word_id") or w.get("id", 0)
             if ok:
                 u["score"] += 1
-                await update.message.reply_text(f"✅ ¡Correcto! ({u['score']}/{u['step']+1})", parse_mode="Markdown")
-                wid = w.get("word_id") or w.get("id", 0)
                 if u.get("user_id") and wid:
                     _api("POST", "/api/vocab/review", {"user_id": u["user_id"], "word_id": wid, "rating": 4})
+                kb = _audio_button(wid)
+                await update.message.reply_text(
+                    f"✅ ¡Correcto! ({u['score']}/{u['step']+1})",
+                    reply_markup=kb)
             else:
-                await update.message.reply_text(f"❌ {fb}", parse_mode="Markdown")
-                wid = w.get("word_id") or w.get("id", 0)
                 if u.get("user_id") and wid:
                     _api("POST", "/api/vocab/review", {"user_id": u["user_id"], "word_id": wid, "rating": 1})
                 w_copy = dict(w)
                 w_copy["_retry"] = w.get("_retry", 0) + 1
                 if w_copy["_retry"] <= 2:
                     u["data"]["lesson_words"].append(w_copy)
-
-        # Send audio AFTER answer (reinforcement) — must upload file, not URL (Tailscale IP not public)
-        wid = w.get("word_id") or w.get("id", 0)
-        if wid:
-            try:
-                audio_url = f"{BACKEND_URL}/static/audio/{wid}.mp3"
-                audio_data = httpx.get(audio_url, timeout=5).content
-                await update.message.reply_audio(
-                    audio_data,
-                    title=w.get('spanish',''),
-                    caption=f"🔊 {w.get('spanish','')}",
-                    filename=f"{w.get('spanish','')}.mp3"
-                )
-            except Exception as e:
-                logger.warning("Audio send failed: %s", e)
+                kb = _audio_button(wid)
+                await update.message.reply_text(f"❌ {fb}", reply_markup=kb, parse_mode="Markdown")
 
         u["step"] += 1
         await _send_translation(update, uid)
@@ -429,6 +491,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("💬 Hermes-Konversation folgt in Phase 3.")
     else:
         await update.message.reply_text("Nutze /help für Kommandos.")
+
+
+def _audio_button(word_id: int) -> InlineKeyboardMarkup | None:
+    if not word_id:
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔊 Audio", callback_data=f"audio_{word_id}")
+    ]])
 
 
 # ── Callback handler ─────────────────────────────────────────────────────────
@@ -455,6 +525,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _api("POST", "/api/vocab/review", {"user_id": u["user_id"], "word_id": word_id, "rating": r})
         u["step"] += 1
         await _send_srs(query, uid)
+
+    elif data.startswith("audio_"):
+        word_id = int(data.split("_")[1])
+        await query.edit_message_reply_markup(reply_markup=None)
+        try:
+            audio_url = f"{BACKEND_URL}/static/audio/{word_id}.mp3"
+            audio_data = httpx.get(audio_url, timeout=5).content
+            u = USER_STATES.get(uid)
+            w = u["data"].get("_cur", {}) if u else {}
+            await query.message.reply_audio(
+                audio_data,
+                title=w.get('spanish',''),
+                caption=f"🔊 {w.get('spanish','')}",
+                filename=f"{w.get('spanish','')}.mp3"
+            )
+        except Exception as e:
+            logger.warning("Audio button failed: %s", e)
 
 
 # ── Grammar / Conversation placeholders ─────────────────────────────────────

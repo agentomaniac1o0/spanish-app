@@ -67,6 +67,16 @@ async def assign_words(data: dict, db: AsyncSession = Depends(get_db)):
     return {"words": assigned, "count": len(assigned)}
 
 
+@router.get("/failed", response_model=list[dict])
+async def get_failed(
+    user_id: int,
+    max_level: str = Query(default="A2", max_length=5),
+    limit: int = Query(default=30, le=50),
+    db: AsyncSession = Depends(get_db),
+):
+    return await crud.get_failed_words(db, user_id, max_level, limit)
+
+
 @router.post("/add")
 async def add_word(data: dict, db: AsyncSession = Depends(get_db)):
     """Hermes adds a new word from conversation. Creates Word + UserWord."""

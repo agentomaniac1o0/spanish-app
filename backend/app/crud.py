@@ -217,6 +217,36 @@ async def get_lesson_list(db: AsyncSession, user_id: int):
     ]
 
 
+async def get_failed_words(db: AsyncSession, user_id: int, max_level: str = "A1", limit: int = 30):
+    result = await db.execute(
+        select(UserWord, Word)
+        .join(Word, UserWord.word_id == Word.id)
+        .where(
+            UserWord.user_id == user_id,
+            UserWord.lapses > 0,
+            Word.level <= max_level,
+        )
+        .order_by(UserWord.lapses.desc(), UserWord.next_review.asc())
+        .limit(limit)
+    )
+    rows = result.all()
+    return [
+        {
+            "word_id": word.id,
+            "spanish": word.spanish,
+            "german": word.german,
+            "unit": word.unit or "",
+            "level": word.level,
+            "state": uw.state,
+            "stability": uw.stability,
+            "difficulty": uw.difficulty,
+            "lapses": uw.lapses,
+            "next_review": uw.next_review,
+        }
+        for uw, word in rows
+    ]
+
+
 async def get_grammar_points(db: AsyncSession, level: Optional[str] = None):
     query = select(GrammarPoint).order_by(GrammarPoint.level, GrammarPoint.sort_order)
     if level:

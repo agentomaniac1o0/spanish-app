@@ -12,6 +12,14 @@ Spanish learning app with AI teacher via Telegram. Hybrid: structured lessons + 
 - **AI:** OpenRouter DeepSeek V4 Flash (same as Hermes)
 - **Hermes:** LXC 105, SSH bridge for conversation mode
 
+## Code Conventions
+
+| Sprach | Skill | Wann laden |
+|--------|-------|------------|
+| Python (Backend) | `/python-conventions` | FastAPI, async SQLAlchemy, Pydantic v2 |
+| | `/code-quality` | Nach jeder Code-Generierung |
+| Tests | `/testing-conventions` | pytest für Bot + Backend |
+
 ## Project Layout
 
 ```
@@ -90,3 +98,15 @@ Ratings: 1=Again, 2=Hard, 3=Good, 4=Easy.
 
 - **Phase 3 (Hermes live-Grammatik + Konversation):** `/gramatica` und `/hablar` sind Platzhalter
 - **4 Unit-Bilder fehlen:** 28/32 Units illustriert
+
+## Session-Log: 2026-06-10
+
+### Picture Mode, Audio, Lesson Scaffold & Review — 5 Bugfixes
+- **Picture Mode Bug**: Bild passte nicht zum abgefragten Wort. Jetzt: wort-spezifische Bilder aus `static/words/word_{id}.jpg`, Fallback auf Unit-Bild
+- **Lesson Scaffold**: `_build_lesson_plan()` erstellt vor Lektionsstart Gerüst: lädt Wörter, identifiziert Picture-Mode-Wörter, prüft ob Bilder existieren
+- **Image Pre-Generation**: Fehlende Bilder werden vor der Lektion per ComfyUI/RunPod generiert (DreamShaper8 LCM), mit Fortschrittsanzeige im Chat
+- **Audio Bug**: Kein Auto-Send mehr. Inline-Button `🔊 Audio` statt automatischem Audio-Send. Telegram playlistet einzelne Audios nicht
+- **Review Filter**: `/review` lädt nur due+failed Wörter, nie neue. Gefiltert nach User-Level (A0/A1 für Beginner). `_load_review_words()` implementiert
+- **Stock Images**: `image_gen.py` generiert Wortbilder via RunPod Serverless (DreamShaper8, 768×768), Two-Pass Upscale → 9.4 MP Stock-PNG → Nextcloud `Home Lab/Spanish App/Wortbilder/`
+- **Backend**: Neuer `GET /api/vocab/failed` Endpoint (crud.py + vocab.py) für häufig falsch beantwortete Wörter
+- **Deployed**: LXC 106, beide Services laufen sauber
